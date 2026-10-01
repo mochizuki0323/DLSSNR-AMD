@@ -44,11 +44,11 @@ CONFIG_DIR = Path.home() / ".config" / "dlssnr-amd-installer"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
 ROUTES = {
-    "gamescope": "Gamescope + OptiScaler (reconstrução neural no Gamescope)",
-    "optiscaler": "jogo tem DLSS/FSR/XeSS (OptiScaler, so 64-bit)",
-    "reshade": "D3D10/11/12 sem upscaler utilizavel",
-    "vulkan": "jogo Vulkan, ou D3D9 (via DXVK)",
-    "dx9": "como vulkan + depth de D3D9 antigos",
+    "gamescope": "Gamescope + OptiScaler (reconstrução neural no Gamescope, só 64-bit)",
+    "optiscaler": "jogo tem DLSS/FSR/XeSS (OptiScaler, só 64-bit)",
+    "reshade": "D3D10/11/12 sem upscaler utilizável (32 e 64-bit)",
+    "vulkan": "jogo Vulkan, ou D3D9 via DXVK (32 e 64-bit)",
+    "dx9": "como vulkan + depth de D3D9 antigos (32 e 64-bit)",
 }
 
 
@@ -71,16 +71,56 @@ def save_config(cfg: dict) -> None:
         pass
 
 
+def supported_bits() -> list[int]:
+    """Retorna lista de arquiteturas (bits) suportadas neste instalador."""
+    bits = set()
+    # 64-bit check:
+    if (
+        (HERE / "reshade" / "dlssnr_amd.addon64").exists()
+        or (HERE / "vulkan" / "x86_64").is_dir()
+        or (HERE / "optiscaler").is_dir()
+        or (HERE / "vulkan" / "ReShade64.dll").exists()
+        or ((HERE / "reshade" / "dxgi.dll").exists() and pe_bits(HERE / "reshade" / "dxgi.dll") == "64")
+        or (HERE / "DLSSNR-AMD" / "artifacts" / "package-build" / "nr" / "package").is_dir()
+    ):
+        bits.add(64)
+    # 32-bit check:
+    if (
+        (HERE / "reshade" / "dlssnr_amd.addon32").exists()
+        or (HERE / "vulkan" / "i686").is_dir()
+        or (HERE / "vulkan" / "ReShade32.dll").exists()
+        or ((HERE / "reshade" / "dxgi.dll").exists() and pe_bits(HERE / "reshade" / "dxgi.dll") == "32")
+        or (HERE / "DLSSNR-AMD" / "artifacts" / "package-build" / "nr32" / "package").is_dir()
+    ):
+        bits.add(32)
+    return sorted(list(bits)) or [64]
+
+
 def package_arch() -> str:
-    if (HERE / "optiscaler").is_dir():
-        return "x86_64"
-    if (HERE / "gamescope").is_dir() or (HERE / "DLSSNR-AMD").is_dir():
-        return "x86_64"
-    return "i686"
+    s = supported_bits()
+    if 64 in s and 32 in s:
+        return "multi-arch"
+    if 32 in s:
+        return "i686"
+    return "x86_64"
+
+
+def package_arch_display() -> str:
+    s = supported_bits()
+    if 64 in s and 32 in s:
+        return "multi-arch (32/64-bit)"
+    if 32 in s:
+        return "i686 (32-bit)"
+    return "x86_64 (64-bit)"
 
 
 def package_bits() -> int:
-    return 32 if (HERE / "reshade" / "dlssnr_amd.addon32").exists() else 64
+    s = supported_bits()
+    if 64 in s and 32 in s:
+        return 0  # 0 indica multi-arch
+    if 32 in s:
+        return 32
+    return 64
 
 
 # --------------------------------------------------------------------------
@@ -100,13 +140,15 @@ def pe_bits(exe: Path):
 
 
 def scan_game_folder(game: Path):
-    """Retorna (exes, ue_warning). exes = [(nome, bits)]."""
+    """Retorna (exes, ue_warning). exes = [(nome, bits)]. ue_warning = (is_ue, arch_folder)."""
     exes = []
     if game.is_dir():
         for exe in sorted(game.glob("*.exe")):
             if exe.is_file():
                 exes.append((exe.name, pe_bits(exe)))
-    ue = bool(glob.glob(str(game / "*" / "Binaries" / "Win64" / "*.exe")))
+    ue_64 = bool(glob.glob(str(game / "*" / "Binaries" / "Win64" / "*.exe")))
+    ue_32 = bool(glob.glob(str(game / "*" / "Binaries" / "Win32" / "*.exe")))
+    ue = (ue_64 or ue_32, "Win32" if ue_32 and not ue_64 else "Win64")
     return exes, ue
 
 
@@ -264,6 +306,55 @@ class Installer:
     def __init__(self, here: Path = HERE):
         self.here = here
 
+    def get_source_paths(self, bits: int) -> dict:
+        """Encontra pastas e arquivos de origem para a arquitetura especificada (32 ou 64)."""
+        paths = {}
+        # 1. reshade folder
+        rs_dir = self.here / "reshade"
+        if not (rs_dir / f"dlssnr_amd.addon{bits}").exists():
+            pkg_alt = self.here / "DLSSNR-AMD" / "artifacts" / "package-build" / ("nr32" if bits == 32 else "nr") / "package" / "reshade"
+            if (pkg_alt / f"dlssnr_amd.addon{bits}").exists():
+                rs_dir = pkg_alt
+        paths["reshade_dir"] = rs_dir
+
+        # 2. vulkan loader folder
+        arch_tag = "i686" if bits == 32 else "x86_64"
+        vk_dir = self.here / "vulkan" / arch_tag
+        if not (vk_dir / "vulkan-1.dll").exists():
+            if (self.here / "vulkan" / "vulkan-1.dll").exists() and pe_bits(self.here / "vulkan" / "vulkan-1.dll") == str(bits):
+                vk_dir = self.here / "vulkan"
+            else:
+                pkg_alt = self.here / "DLSSNR-AMD" / "artifacts" / "package-build" / ("nr32" if bits == 32 else "nr") / "package" / "vulkan"
+                if (pkg_alt / "vulkan-1.dll").exists():
+                    vk_dir = pkg_alt
+                elif (self.here / "DLSSNR-AMD" / "artifacts" / "vulkan-loader" / arch_tag / "vulkan-1.dll").exists():
+                    vk_dir = self.here / "DLSSNR-AMD" / "artifacts" / "vulkan-loader" / arch_tag
+        paths["vulkan_dir"] = vk_dir
+
+        # 3. addon file
+        addon_name = f"dlssnr_amd.addon{bits}"
+        addon_src = rs_dir / addon_name
+        if not addon_src.exists():
+            alt_addon = self.here / "DLSSNR-AMD" / "artifacts" / "package-build" / ("nr32" if bits == 32 else "nr") / addon_name
+            if alt_addon.exists():
+                addon_src = alt_addon
+        paths["addon"] = addon_src
+
+        # 4. reshade dll
+        reshade_dll_name = f"ReShade{bits}.dll"
+        rs_dll_src = rs_dir / reshade_dll_name
+        if not rs_dll_src.exists() and vk_dir and (vk_dir / reshade_dll_name).exists():
+            rs_dll_src = vk_dir / reshade_dll_name
+        if not rs_dll_src.exists() and (rs_dir / "dxgi.dll").exists() and pe_bits(rs_dir / "dxgi.dll") == str(bits):
+            rs_dll_src = rs_dir / "dxgi.dll"
+        if not rs_dll_src.exists():
+            alt_rs = self.here / "DLSSNR-AMD" / "artifacts" / "ref" / "reshade-6.8.0" / reshade_dll_name
+            if alt_rs.exists():
+                rs_dll_src = alt_rs
+        paths["reshade_dll"] = rs_dll_src
+
+        return paths
+
     def extract_optiscaler_release(self, tmp: Path, log) -> None:
         zips = sorted((self.here / "optiscaler").glob("OptiScaler*.zip"))
         if not zips:
@@ -287,16 +378,39 @@ class Installer:
         log(f"  extraidos {count} arquivos de {src.name}")
 
     def run(self, game: Path, route: str, dll: str | None, ini_overrides: dict,
-            log, progress, remember_dll: bool = True) -> str:
+            log, progress, remember_dll: bool = True, target_bits: int | None = None) -> str:
         """Executa a instalacao. progress(fracao 0..1, texto). Retorna launch options."""
         if route not in ROUTES:
             raise RuntimeError(f"rota desconhecida: {route}")
         if not game.is_dir():
             raise RuntimeError(f"pasta nao encontrada: {game}")
         game = game.resolve()
+
+        if target_bits not in (32, 64):
+            exes, _ = scan_game_folder(game)
+            ebits = [int(b) for _, b in exes if b in ("32", "64")]
+            if ebits:
+                target_bits = ebits[0]
+            else:
+                supp = supported_bits()
+                target_bits = 32 if 32 in supp and 64 not in supp else 64
+
+        if target_bits == 32 and route in ("optiscaler", "gamescope"):
+            raise RuntimeError(
+                "A rota OptiScaler / Gamescope NÃO é compatível com jogos 32-bit.\n"
+                "O OptiScaler e o DLSS da NVIDIA são exclusivos para 64-bit (x86_64).\n"
+                "Para jogos 32-bit, selecione a rota 'reshade', 'vulkan' ou 'dx9'."
+            )
         if route in ("optiscaler", "gamescope") and not (self.here / "optiscaler").is_dir():
             raise RuntimeError("A rota OptiScaler / Gamescope so existe no pacote 64-bit.")
-        bits = package_bits()
+
+        supp = supported_bits()
+        if target_bits not in supp:
+            raise RuntimeError(
+                f"Este instalador não possui binários para {target_bits}-bit. "
+                f"Arquiteturas disponíveis: {', '.join(str(b)+'-bit' for b in supp)}."
+            )
+
         pkg_model = self.here / "dlssnr-amd" / MODEL_NAME
 
         progress(0.02, "Verificando modelo...")
@@ -322,7 +436,7 @@ class Installer:
             log("Instalacao anterior encontrada, removendo antes...")
             uninstall_game(game, log)
 
-        progress(0.32, "Copiando dlssnr-amd/...")
+        progress(0.32, f"Copiando dlssnr-amd/ ({target_bits}-bit)...")
         manifest.write_text("dlssnr-amd-install.txt\n", encoding="utf-8")
         records = ["dlssnr-amd-install.txt"]
 
@@ -346,7 +460,7 @@ class Installer:
             shutil.copy2(model_src, game / "dlssnr-amd" / MODEL_NAME)
             log("  modelo copiado do temporario (pacote sem escrita).")
 
-        progress(0.50, f"Instalando rota {route}...")
+        progress(0.50, f"Instalando rota {route} ({target_bits}-bit)...")
         if route in ("optiscaler", "gamescope"):
             with tempfile.TemporaryDirectory() as t:
                 tmp = Path(t)
@@ -409,27 +523,95 @@ class Installer:
                 else:
                     log("  AVISO: Binario gamescope compilado nao encontrado em gamescope/build/src/gamescope.")
         elif route == "reshade":
-            items = sorted((self.here / "reshade").iterdir(), key=lambda p: p.name)
-            for i, f in enumerate(items):
-                if f.is_dir():
-                    put_tree(f, f.name)
-                else:
-                    put_file(f, f.name)
-                progress(0.50 + 0.30 * (i + 1) / max(len(items), 1), f"ReShade: {f.name}")
+            sources = self.get_source_paths(target_bits)
+            rs_dir = sources["reshade_dir"]
+            addon_file = sources["addon"]
+            rs_dll = sources["reshade_dll"]
+            if not rs_dir.is_dir() or not addon_file or not addon_file.exists() or not rs_dll or not rs_dll.exists():
+                raise RuntimeError(f"Arquivos do ReShade {target_bits}-bit incompletos ou não encontrados.")
+
+            log(f"Instalando ReShade {target_bits}-bit...")
+            put_file(addon_file, addon_file.name)
+            put_file(rs_dll, "dxgi.dll")
+            if (rs_dir / "reshade-shaders").is_dir():
+                put_tree(rs_dir / "reshade-shaders", "reshade-shaders")
+            for f in ("ReShade.ini", "ReShadePreset.ini", "ReShade-LICENSE.md"):
+                p = rs_dir / f
+                if p.exists():
+                    put_file(p, f)
+            progress(0.80, f"ReShade {target_bits}-bit instalado.")
             overrides = "dxgi=n,b"
         else:  # vulkan / dx9
-            items = sorted(list((self.here / "reshade").iterdir()) + list((self.here / "vulkan").iterdir()),
-                           key=lambda p: p.name)
-            items = [f for f in items if f.name not in ("dxgi.dll", "ReShadePreset-d3d9.ini")]
-            for i, f in enumerate(items):
-                if f.is_dir():
-                    put_tree(f, f.name)
-                else:
-                    put_file(f, f.name)
-                progress(0.50 + 0.30 * (i + 1) / max(len(items), 1), f"{f.name}")
+            sources = self.get_source_paths(target_bits)
+            rs_dir = sources["reshade_dir"]
+            vk_dir = sources["vulkan_dir"]
+            addon_file = sources["addon"]
+            rs_dll = sources["reshade_dll"]
+            if not vk_dir or not vk_dir.is_dir() or not addon_file or not addon_file.exists() or not rs_dll or not rs_dll.exists():
+                raise RuntimeError(f"Arquivos Vulkan Loader {target_bits}-bit incompletos ou não encontrados.")
+
+            log(f"Instalando Vulkan Layer {target_bits}-bit ({route})...")
+            put_file(addon_file, addon_file.name)
+            put_file(rs_dll, rs_dll.name)
+
+            for f in ("vulkan-1.dll", "winevulkan.dll", "PATCHES.diff", "Vulkan-Loader-LICENSE.txt"):
+                p = vk_dir / f
+                if p.exists():
+                    put_file(p, f)
+
+            vk_over = vk_dir / "vk-override"
+            if vk_over.is_dir():
+                put_tree(vk_over, "vk-override")
+            else:
+                icd_dir = game / "vk-override"
+                icd_dir.mkdir(parents=True, exist_ok=True)
+                (icd_dir / "nr-icd.json").write_text(
+                    '{\n  "file_format_version": "1.0.0",\n  "ICD": {\n    "library_path": "C:\\\\windows\\\\system32\\\\winevulkan.dll",\n    "api_version": "1.3.0"\n  }\n}\n',
+                    encoding="utf-8"
+                )
+                record("vk-override/nr-icd.json")
+                imp_dir = icd_dir / "implicit_layer"
+                imp_dir.mkdir(parents=True, exist_ok=True)
+                json_content = (
+                    '{\n'
+                    '  "file_format_version": "1.0.0",\n'
+                    '  "layer": {\n'
+                    '    "name": "VK_LAYER_reshade",\n'
+                    '    "type": "GLOBAL",\n'
+                    f'    "library_path": "..\\\\..\\\\ReShade{target_bits}.dll",\n'
+                    '    "api_version": "1.3.0",\n'
+                    '    "implementation_version": "1",\n'
+                    '    "description": "ReShade",\n'
+                    '    "functions": {\n'
+                    '      "vkGetInstanceProcAddr": "vkGetInstanceProcAddr",\n'
+                    '      "vkGetDeviceProcAddr": "vkGetDeviceProcAddr",\n'
+                    '      "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"\n'
+                    '    },\n'
+                    '    "disable_environment": { "DISABLE_RESHADE": "1" }\n'
+                    '  }\n'
+                    '}\n'
+                )
+                (imp_dir / f"ReShade{target_bits}.json").write_text(json_content, encoding="utf-8")
+                record(f"vk-override/implicit_layer/ReShade{target_bits}.json")
+
+            if (rs_dir / "reshade-shaders").is_dir():
+                put_tree(rs_dir / "reshade-shaders", "reshade-shaders")
+            if (rs_dir / "ReShade.ini").exists():
+                put_file(rs_dir / "ReShade.ini", "ReShade.ini")
+
             if route == "dx9":
-                shutil.copy2(self.here / "vulkan" / "ReShadePreset-d3d9.ini", game / "ReShadePreset.ini")
-                record("ReShadePreset.ini")
+                preset_dx9 = vk_dir / "ReShadePreset-d3d9.ini"
+                if not preset_dx9.exists():
+                    preset_dx9 = self.here / "vulkan" / "ReShadePreset-d3d9.ini"
+                if preset_dx9.exists():
+                    shutil.copy2(preset_dx9, game / "ReShadePreset.ini")
+                    record("ReShadePreset.ini")
+                    log("  copiado ReShadePreset-d3d9.ini como ReShadePreset.ini")
+            else:
+                if (rs_dir / "ReShadePreset.ini").exists():
+                    put_file(rs_dir / "ReShadePreset.ini", "ReShadePreset.ini")
+
+            progress(0.80, f"Vulkan ({route}) {target_bits}-bit instalado.")
             overrides = "winevulkan=n,b;vulkan-1=n,b"
         if route not in ("optiscaler", "gamescope"):
             record("dlssnr-amd.ini")
@@ -804,19 +986,30 @@ def run_gui():
         lst_exe.delete(0, "end")
         warns = []
         if game and game.is_dir():
-            exes, ue = scan_game_folder(game)
+            exes, (ue, ue_folder) = scan_game_folder(game)
             for name, b in exes:
                 lst_exe.insert("end", f"{name}  [{b}-bit]")
+            if lst_exe.size() > 0 and not lst_exe.curselection():
+                lst_exe.selection_set(0)
             if not exes:
                 warns.append("Nenhum *.exe na pasta. Confira se e a pasta do executavel.")
             if ue:
-                warns.append("Parece a pasta raiz de um jogo Unreal Engine; "
-                             "instale em <projeto>/Binaries/Win64 (*-Shipping.exe).")
-            bits = package_bits()
-            ebits = sorted({b for _, b in exes if b in ("32", "64")})
-            if ebits and str(bits) not in ebits:
-                warns.append(f"Pacote {bits}-bit, mas o exe e {'/'.join(ebits)}-bit; "
-                             "DLLs da outra arquitetura nao carregam.")
+                warns.append(f"Parece a pasta raiz de um jogo Unreal Engine; instale em <projeto>/Binaries/{ue_folder} (*.exe).")
+            supp = supported_bits()
+            ebits = sorted({int(b) for _, b in exes if b in ("32", "64")})
+            cur_route = var_route.get()
+            if 32 in ebits:
+                if cur_route in ("optiscaler", "gamescope"):
+                    warns.append("⚠️ O executável selecionado é 32-bit. As rotas OptiScaler e Gamescope são exclusivas para jogos 64-bit! Selecione 'reshade', 'vulkan' ou 'dx9'.")
+                if 32 in supp:
+                    warns.append("ℹ️ Jogo 32-bit (i686) detectado. O instalador usará os binários 32-bit (dlssnr_amd.addon32 / ReShade32).")
+                else:
+                    warns.append("❌ Jogo 32-bit, mas este instalador não possui binários 32-bit compilados.")
+            elif 64 in ebits:
+                if 64 in supp:
+                    warns.append("ℹ️ Jogo 64-bit (x86_64) detectado.")
+                else:
+                    warns.append("❌ Jogo 64-bit, mas este instalador não possui binários 64-bit compilados.")
             man = game / "dlssnr-amd-install.txt"
             if man.exists():
                 warns.append(f"Instalacao anterior detectada ({man.name}); sera removida antes.")
@@ -869,6 +1062,23 @@ def run_gui():
         if not var_game.get().strip():
             messagebox.showwarning("Instalador", "Escolha a pasta do jogo.")
             return
+
+        sel_idx = lst_exe.curselection()
+        target_bits = None
+        if sel_idx:
+            sel_text = lst_exe.get(sel_idx[0])
+            m = re.search(r"\[(32|64)-bit\]", sel_text)
+            if m:
+                target_bits = int(m.group(1))
+
+        if target_bits == 32 and route in ("optiscaler", "gamescope"):
+            messagebox.showwarning(
+                "Rota Incompatível (32-bit)",
+                "As rotas OptiScaler e Gamescope são exclusivas para jogos 64-bit (x86_64).\n\n"
+                "Para jogos 32-bit, selecione a rota 'reshade', 'vulkan' ou 'dx9'."
+            )
+            return
+
         # reutiliza caminho guardado se o campo estiver vazio
         if not dll:
             saved = load_config().get("last_dll", "")
@@ -882,7 +1092,7 @@ def run_gui():
         def worker():
             try:
                 launch = inst.run(game, route, dll, ov, log, progress,
-                                  remember_dll=var_remember.get())
+                                  remember_dll=var_remember.get(), target_bits=target_bits)
                 msg_q.put(("log", f"\nOK. Use: {launch}"))
             except Exception as e:
                 msg_q.put(("log", f"\nERRO: {e}"))
@@ -1212,25 +1422,38 @@ def run_gui_ctk():
         game = Path(var_game.get()).expanduser() if var_game.get().strip() else None
         warns = []
         if game and game.is_dir():
-            exes, ue = scan_game_folder(game)
+            exes, (ue, ue_folder) = scan_game_folder(game)
             if exes:
                 if not var_exe.get() or var_exe.get() not in [n for n, _ in exes]:
                     var_exe.set(exes[0][0])
                 for name, b in exes:
                     ctk.CTkRadioButton(exe_box, text=f"{name}   [{b}-bit]",
                                        variable=var_exe, value=name,
+                                       command=refresh_scan,
                                        font=("Sans", 12)).pack(anchor="w", pady=1)
             else:
                 ctk.CTkLabel(exe_box, text="Nenhum *.exe na pasta.", font=("Sans", 12),
                              text_color="gray").pack(anchor="w")
                 warns.append("Nenhum *.exe na pasta. Confira se é a pasta do executável.")
             if ue:
-                warns.append("Parece a pasta raiz de um jogo Unreal Engine — "
-                             "instale em <projeto>/Binaries/Win64 (*-Shipping.exe).")
-            bits = package_bits()
-            ebits = sorted({b for _, b in exes if b in ("32", "64")})
-            if ebits and str(bits) not in ebits:
-                warns.append(f"Pacote {bits}-bit, mas o exe é {'/'.join(ebits)}-bit.")
+                warns.append(f"Parece a pasta raiz de um jogo Unreal Engine — instale em <projeto>/Binaries/{ue_folder} (*.exe).")
+            supp = supported_bits()
+            cur_exe = var_exe.get()
+            exe_dict = dict(exes)
+            bits = int(exe_dict.get(cur_exe, exes[0][1])) if exes and exe_dict.get(cur_exe, exes[0][1]) in ("32", "64") else 64
+            cur_route = var_route.get()
+            if bits == 32:
+                if cur_route in ("optiscaler", "gamescope"):
+                    warns.append("⚠️ O executável selecionado é 32-bit. As rotas OptiScaler e Gamescope são exclusivas para jogos 64-bit! Selecione 'reshade', 'vulkan' ou 'dx9'.")
+                if 32 in supp:
+                    warns.append("ℹ️ Jogo 32-bit (i686) detectado. O instalador usará os binários 32-bit (dlssnr_amd.addon32 / ReShade32).")
+                else:
+                    warns.append("❌ Jogo 32-bit, mas este instalador não possui binários 32-bit compilados.")
+            elif bits == 64:
+                if 64 in supp:
+                    warns.append("ℹ️ Jogo 64-bit (x86_64) detectado.")
+                else:
+                    warns.append("❌ Jogo 64-bit, mas este instalador não possui binários 64-bit compilados.")
             if (game / "dlssnr-amd-install.txt").exists():
                 warns.append("Instalação anterior detectada; será removida antes.")
         elif var_game.get().strip():
@@ -1281,6 +1504,25 @@ def run_gui_ctk():
         if not var_game.get().strip():
             messagebox.showwarning("Instalador", "Escolha a pasta do jogo.")
             return
+
+        cur_exe = var_exe.get()
+        target_bits = None
+        if game.is_dir():
+            exes, _ = scan_game_folder(game)
+            exe_dict = dict(exes)
+            if cur_exe in exe_dict and exe_dict[cur_exe] in ("32", "64"):
+                target_bits = int(exe_dict[cur_exe])
+            elif exes and exes[0][1] in ("32", "64"):
+                target_bits = int(exes[0][1])
+
+        if target_bits == 32 and route in ("optiscaler", "gamescope"):
+            messagebox.showwarning(
+                "Rota Incompatível (32-bit)",
+                "As rotas OptiScaler e Gamescope são exclusivas para jogos 64-bit (x86_64).\n\n"
+                "Para jogos 32-bit, selecione a rota 'reshade', 'vulkan' ou 'dx9'."
+            )
+            return
+
         if not dll:
             saved = load_config().get("last_dll", "")
             if saved and Path(saved).exists():
@@ -1295,7 +1537,7 @@ def run_gui_ctk():
         def worker():
             try:
                 launch = inst.run(game, route, dll, ov, log, progress,
-                                  remember_dll=var_remember.get())
+                                  remember_dll=var_remember.get(), target_bits=target_bits)
                 msg_q.put(("log", f"\nOK. Use: {launch}"))
             except Exception as e:
                 msg_q.put(("log", f"\nERRO: {e}"))
@@ -1462,9 +1704,10 @@ def run_gui_qt():
     from PySide6.QtCore import Qt, QTimer
     from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
                                    QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
-                                   QListWidget, QMainWindow, QMessageBox, QPlainTextEdit,
-                                   QProgressBar, QPushButton, QRadioButton, QScrollArea,
-                                   QSizePolicy, QSpacerItem, QTabWidget, QVBoxLayout, QWidget)
+                                   QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
+                                   QPlainTextEdit, QProgressBar, QPushButton, QRadioButton,
+                                   QScrollArea, QSizePolicy, QSpacerItem, QTabWidget,
+                                   QVBoxLayout, QWidget)
 
     class Window(QMainWindow):
         def __init__(self):
@@ -1573,6 +1816,7 @@ def run_gui_qt():
             l.addWidget(QLabel("<b>Executáveis encontrados</b>"))
             self.exe_list = QListWidget()
             self.exe_list.setMaximumHeight(96)
+            self.exe_list.itemSelectionChanged.connect(self._on_exe_selected)
             l.addWidget(self.exe_list)
             self.lbl_warn = QLabel("")
             self.lbl_warn.setObjectName("warn")
@@ -1679,7 +1923,26 @@ def run_gui_qt():
             for rid, rb in self.route_btns.items():
                 if rb.isChecked():
                     self.route = rid
-            self.lbl_launch.setText("Steam launch options:  " + LAUNCH_HINTS.get(self.route, ""))
+            self._update_warnings()
+
+        def _on_exe_selected(self):
+            if getattr(self, "_updating_scan", False):
+                return
+            item = self.exe_list.currentItem()
+            if item:
+                self._selected_exe_name = item.data(Qt.UserRole)
+            self._update_warnings()
+
+        def get_selected_exe_bits(self) -> tuple[str | None, int | None]:
+            item = self.exe_list.currentItem()
+            if item:
+                exe_name = item.data(Qt.UserRole)
+                bits = item.data(Qt.UserRole + 1)
+                if bits in (32, 64):
+                    return exe_name, bits
+                elif bits in ("32", "64"):
+                    return exe_name, int(bits)
+            return None, None
 
         def log(self, msg):
             self.msg_q.put(("log", str(msg)))
@@ -1713,28 +1976,73 @@ def run_gui_qt():
                 pass
 
         def refresh_scan(self):
+            self._updating_scan = True
+            current_selected = getattr(self, "_selected_exe_name", None)
             self.exe_list.clear()
+            game = Path(self.ed_game.text()).expanduser() if self.ed_game.text().strip() else None
+            matched_row = -1
+            if game and game.is_dir():
+                exes, (is_ue, ue_folder) = scan_game_folder(game)
+                for i, (name, b) in enumerate(exes):
+                    item = QListWidgetItem(f"{name}   [{b}-bit]")
+                    item.setData(Qt.UserRole, name)
+                    try:
+                        b_int = int(b)
+                    except ValueError:
+                        b_int = None
+                    item.setData(Qt.UserRole + 1, b_int)
+                    self.exe_list.addItem(item)
+                    if current_selected and name == current_selected:
+                        matched_row = i
+
+                if self.exe_list.count() > 0:
+                    if matched_row >= 0:
+                        self.exe_list.setCurrentRow(matched_row)
+                    else:
+                        self.exe_list.setCurrentRow(0)
+                        self._selected_exe_name = exes[0][0]
+                else:
+                    self._selected_exe_name = None
+            else:
+                self._selected_exe_name = None
+
+            self._updating_scan = False
+            self._update_warnings()
+
+        def _update_warnings(self):
             game = Path(self.ed_game.text()).expanduser() if self.ed_game.text().strip() else None
             warns = []
             if game and game.is_dir():
-                exes, ue = scan_game_folder(game)
-                for name, b in exes:
-                    self.exe_list.addItem(f"{name}   [{b}-bit]")
-                if self.exe_list.count():
-                    self.exe_list.setCurrentRow(0)
+                exes, (is_ue, ue_folder) = scan_game_folder(game)
                 if not exes:
                     warns.append("Nenhum *.exe na pasta. Confira se é a pasta do executável.")
-                if ue:
-                    warns.append("Parece a pasta raiz de um jogo Unreal Engine — "
-                                 "instale em <projeto>/Binaries/Win64 (*-Shipping.exe).")
-                bits = package_bits()
-                ebits = sorted({b for _, b in exes if b in ("32", "64")})
-                if ebits and str(bits) not in ebits:
-                    warns.append(f"Pacote {bits}-bit, mas o exe é {'/'.join(ebits)}-bit.")
+                if is_ue:
+                    warns.append(f"Parece a pasta raiz de um jogo Unreal Engine — "
+                                 f"instale em <projeto>/Binaries/{ue_folder} (*.exe).")
+
+                supp = supported_bits()
+                exe_name, bits = self.get_selected_exe_bits()
+                if bits is None and exes and exes[0][1] in ("32", "64"):
+                    bits = int(exes[0][1])
+
+                if bits == 32:
+                    if self.route in ("optiscaler", "gamescope"):
+                        warns.append("⚠️ O executável selecionado é 32-bit. As rotas OptiScaler e Gamescope são exclusivas para jogos 64-bit! Selecione 'reshade', 'vulkan' ou 'dx9'.")
+                    if 32 in supp:
+                        warns.append("ℹ️ Jogo 32-bit (i686) detectado. O instalador usará os binários 32-bit (dlssnr_amd.addon32 / ReShade32).")
+                    else:
+                        warns.append("❌ Jogo 32-bit, mas este instalador não possui binários 32-bit compilados.")
+                elif bits == 64:
+                    if 64 in supp:
+                        warns.append("ℹ️ Jogo 64-bit (x86_64) detectado.")
+                    else:
+                        warns.append("❌ Jogo 64-bit, mas este instalador não possui binários 64-bit compilados.")
+
                 if (game / "dlssnr-amd-install.txt").exists():
                     warns.append("Instalação anterior detectada; será removida antes.")
             elif self.ed_game.text().strip():
                 warns.append("Pasta não encontrada.")
+
             self.lbl_warn.setText("\n".join(warns))
             self.lbl_launch.setText("Steam launch options:  " + LAUNCH_HINTS.get(self.route, ""))
             pm = HERE / "dlssnr-amd" / MODEL_NAME
@@ -1813,6 +2121,22 @@ def run_gui_qt():
             if not self.ed_game.text().strip():
                 QMessageBox.warning(self, "Instalador", "Escolha a pasta do jogo.")
                 return
+
+            _name, target_bits = self.get_selected_exe_bits()
+            if target_bits is None and game.is_dir():
+                exes, _ = scan_game_folder(game)
+                if exes and exes[0][1] in ("32", "64"):
+                    target_bits = int(exes[0][1])
+
+            if target_bits == 32 and self.route in ("optiscaler", "gamescope"):
+                QMessageBox.warning(
+                    self,
+                    "Rota Incompatível (32-bit)",
+                    "As rotas OptiScaler e Gamescope são exclusivas para jogos 64-bit (x86_64).\n\n"
+                    "Para jogos 32-bit, selecione a rota 'reshade', 'vulkan' ou 'dx9'."
+                )
+                return
+
             dll = self.ed_dll.text().strip() or None
             if not dll:
                 saved = load_config().get("last_dll", "")
@@ -1827,7 +2151,7 @@ def run_gui_qt():
 
             def fn():
                 launch = self.inst.run(game, route, dll, ov, self.log, self.progress,
-                                       remember_dll=remember)
+                                       remember_dll=remember, target_bits=target_bits)
                 self.msg_q.put(("log", f"\nOK. Use: {launch}"))
             self._run_worker(fn)
 

@@ -118,7 +118,9 @@ bash linux/build/assemble_product_data.sh "$pkg" ${model:+--model "$model"}
 # model-tools/: what install.sh --dll runs to rebuild the model from the DLL.
 mt="$pkg/model-tools"
 mkdir -p -- "$mt"
-cp -- linux/package/model-tools/* "$mt/"
+for f in linux/package/model-tools/*; do
+    [[ -f "$f" ]] && cp -- "$f" "$mt/"
+done
 
 # reshade/: copied into the game folder as-is (ReShade as dxgi.dll).
 rs="$pkg/reshade"
@@ -209,6 +211,9 @@ if [[ "$arch" == x86_64 ]]; then
 fi
 
 cp -- linux/package/install.sh linux/package/README.txt "$pkg/"
+for gui in installer-gui.py install-gui.sh; do
+    [[ -f "linux/package/$gui" ]] && cp -- "linux/package/$gui" "$pkg/" && chmod +x "$pkg/$gui"
+done
 chmod +x "$pkg/install.sh" "$mt/extract_model.sh"
 
 # ---- archive ------------------------------------------------------------------
