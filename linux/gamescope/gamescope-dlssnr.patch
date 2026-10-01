@@ -1,0 +1,124 @@
+diff --git a/src/meson.build b/src/meson.build
+index 662f752..fcfcc71 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -122,6 +122,9 @@ src = [
+   'x11cursor.cpp',
+   'InputEmulation.cpp',
+   'LibInputHandler.cpp',
++  'dlssnr/nr_gamescope_host.cpp',
++  'dlssnr/nr_gamescope_ipc.cpp',
++  'dlssnr/nr_gamescope_config.cpp',
+ ]
+ 
+ luajit_dep = dependency( 'luajit' )
+diff --git a/src/rendervulkan.cpp b/src/rendervulkan.cpp
+index b534b51..7261b91 100644
+--- a/src/rendervulkan.cpp
++++ b/src/rendervulkan.cpp
+@@ -32,6 +32,8 @@
+ #include "wlr_end.hpp"
+ 
+ #include "rendervulkan.hpp"
++#include "dlssnr/nr_gamescope_host.hpp"
++#include "dlssnr/nr_gamescope_config.hpp"
+ #include "main.hpp"
+ #include "steamcompmgr.hpp"
+ #include "log.hpp"
+@@ -138,6 +140,8 @@ std::span<const uint64_t> GetSupportedSampleModifiers( uint32_t uDrmFormat )
+ }
+ 
+ static LogScope vk_log("vulkan");
++static std::unique_ptr<nr::pe::gamescope::Host> g_dlssnr_host;
++static gamescope::Rc<CVulkanTexture> g_dlssnr_target_tex;
+ 
+ static void vk_errorf(VkResult result, const char *fmt, ...) {
+ 	static char buf[1024];
+@@ -3564,6 +3568,33 @@ bool vulkan_init( VkInstance instance, VkSurfaceKHR surface )
+ 	if (!init_nis_data())
+ 		return false;
+ 
++	if (nr::pe::gamescope::bridge_requested())
++	{
++		auto config = nr::pe::gamescope::load_bridge_config("");
++		if (config.enabled)
++		{
++			g_dlssnr_host = std::make_unique<nr::pe::gamescope::Host>(
++				g_device.instance(),
++				g_device.physDev(),
++				g_device.device(),
++				g_device.queue(),
++				g_device.queueFamily(),
++				config.socket_path
++			);
++			if (g_dlssnr_host->start())
++			{
++				setenv("NR_GAMESCOPE_SOCKET", g_dlssnr_host->socket_path().c_str(), 1);
++				setenv("NR_GAMESCOPE_BRIDGE", "1", 0);
++				vk_log.infof("[dlssnr] Gamescope DLSS-NR host started, socket %s", g_dlssnr_host->socket_path().c_str());
++			}
++			else
++			{
++				vk_log.errorf("[dlssnr] Failed to start DLSS-NR host");
++				g_dlssnr_host.reset();
++			}
++		}
++	}
++
+ 	if ( GetBackend()->UsesVulkanSwapchain() )
+ 	{
+ 		std::thread present_wait_thread( present_wait_thread_func );
+@@ -4000,6 +4031,53 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
+ 	if (!frameInfo->applyOutputColorMgmt)
+ 		outputTF = EOTF_Count; //Disable blending stuff.
+ 
++	if (g_dlssnr_host)
++	{
++		if (!g_dlssnr_host->is_active())
++		{
++			g_dlssnr_host->accept_connection();
++		}
++
++		if (g_dlssnr_host->is_active() && frameInfo->layers[0].tex)
++		{
++			auto srcTex = frameInfo->layers[0].tex;
++			uint32_t w = srcTex->width();
++			uint32_t h = srcTex->height();
++			uint32_t drmFmt = srcTex->drmFormat();
++			VkFormat vkFmt = srcTex->format();
++
++			if (w > 0 && h > 0 && srcTex->vkImage() != VK_NULL_HANDLE)
++			{
++				if (!g_dlssnr_target_tex ||
++				    g_dlssnr_target_tex->width() != w ||
++				    g_dlssnr_target_tex->height() != h ||
++				    g_dlssnr_target_tex->drmFormat() != drmFmt)
++				{
++					g_dlssnr_target_tex = new CVulkanTexture();
++					CVulkanTexture::createFlags flags;
++					flags.bSampled = true;
++					flags.bTransferDst = true;
++					flags.bTransferSrc = true;
++					if (!g_dlssnr_target_tex->BInit(w, h, 1u, drmFmt, flags))
++					{
++						g_dlssnr_target_tex = nullptr;
++					}
++				}
++
++				if (g_dlssnr_target_tex)
++				{
++					if (g_dlssnr_host->send_frame(VK_NULL_HANDLE, srcTex->vkImage(), vkFmt, w, h, VK_IMAGE_LAYOUT_GENERAL))
++					{
++						if (g_dlssnr_host->receive_result(VK_NULL_HANDLE, g_dlssnr_target_tex->vkImage(), VK_IMAGE_LAYOUT_GENERAL))
++						{
++							frameInfo->layers[0].tex = g_dlssnr_target_tex;
++						}
++					}
++				}
++			}
++		}
++	}
++
+ 	g_pLastReshadeEffect = nullptr;
+ 	if (!g_reshade_effect.empty())
+ 	{

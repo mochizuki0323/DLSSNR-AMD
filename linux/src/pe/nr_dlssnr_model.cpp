@@ -28,6 +28,8 @@
 #include "nr_pe_log.hpp"
 #include "nr_pe_session.hpp"
 #include "nr_pe_vkdevice.hpp"
+#include "nr_gamescope_bridge.hpp"
+#include "nr_gamescope_config.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -226,6 +228,29 @@ std::string g_last_error;
 // The Vulkan device the caller initialised us on, and whether a submittable queue was found for it.
 nr::pe::DeviceHandles g_vk_handles;
 bool g_vk_queue_known = false;
+
+// Gamescope compositor bridge: imports frames from Gamescope's host process,
+// runs them through the Mochizuki NR network, and exports them back.
+std::unique_ptr<nr::pe::gamescope::Bridge> g_vk_bridge;
+
+nr::pe::gamescope::Bridge* vk_bridge() {
+    if (!g_vk_bridge && g_vk_handles.valid() && g_vk_queue_known) {
+        VkQueue queue = VK_NULL_HANDLE;
+        uint32_t family = 0;
+        nr::pe::vkdevice::queue_for(g_vk_handles.device, &queue, &family);
+        nr::pe::QueueAccess access{};
+        access.queue = queue;
+        access.family = family;
+        const char* folder = nr::pe::module_folder();
+        std::string ini_path = (*folder) ? (std::string(folder) + "/dlssnr-amd.ini") : "";
+        auto config = nr::pe::gamescope::load_bridge_config(ini_path);
+        if (config.enabled) {
+            g_vk_bridge = std::make_unique<nr::pe::gamescope::Bridge>(g_vk_handles, access, config);
+            g_vk_bridge->connect();
+        }
+    }
+    return g_vk_bridge.get();
+}
 
 // One image copy with the barriers around it, for moving our answer into the caller's output image.
 // OptiScaler's Vulkan path leaves its output in VK_IMAGE_LAYOUT_GENERAL immediately before evaluate
@@ -1193,6 +1218,19 @@ int vk_init(void* instance, void* physical_device, void* device) {
 
     vk_session().set_vulkan_queue(queue, family);
     log("[nr] Vulkan model init: device %p, queue family %u", device, family);
+
+    // Create a Bridge instance during session setup
+    nr::pe::QueueAccess access{};
+    access.queue = queue;
+    access.family = family;
+    const char* folder = nr::pe::module_folder();
+    std::string ini_path = (*folder) ? (std::string(folder) + "/dlssnr-amd.ini") : "";
+    auto bridge_config = nr::pe::gamescope::load_bridge_config(ini_path);
+    if (bridge_config.enabled) {
+        g_vk_bridge = std::make_unique<nr::pe::gamescope::Bridge>(g_vk_handles, access, bridge_config);
+        g_vk_bridge->connect();
+    }
+
     return static_cast<int>(NVSDK_NGX_Result_Success);
 }
 
@@ -1305,7 +1343,18 @@ int evaluate_vk(void* cmd_buffer, Feature* f, void* params, const void* color, c
     write_evaluate_keys(params, controls, frame.reset, depth_inverted);
 
     auto& session = vk_session();
-    VkImage answer = session.run_vulkan(g_vk_handles, cmd, frame, f->controls);
+    auto* bridge = vk_bridge();
+    if (bridge && !bridge->is_connected()) {
+        bridge->connect();
+    }
+
+    VkImage answer = VK_NULL_HANDLE;
+    if (bridge && bridge->is_enabled()) {
+        answer = bridge->process_frame(session, cmd, frame, f->controls);
+    }
+    if (answer == VK_NULL_HANDLE) {
+        answer = session.run_vulkan(g_vk_handles, cmd, frame, f->controls);
+    }
 
     const bool ran = answer != VK_NULL_HANDLE;
     if (ran && answer == out_image) {
