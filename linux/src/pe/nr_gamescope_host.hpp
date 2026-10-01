@@ -99,6 +99,11 @@ private:
 
     ExtFunctions ext_;
     uint8_t device_uuid_[VK_UUID_SIZE] = {};
+    uint32_t consecutive_timeouts_ = 0;
+
+public:
+    bool is_in_fallback_mode() const { return consecutive_timeouts_ >= 2; }
+    uint32_t consecutive_timeouts() const { return consecutive_timeouts_; }
 };
 
 }  // namespace nr::pe::gamescope

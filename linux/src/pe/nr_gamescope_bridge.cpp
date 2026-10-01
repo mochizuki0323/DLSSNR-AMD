@@ -28,6 +28,7 @@ void Bridge::shutdown() {}
 #include <cstring>
 #include <cerrno>
 #include <vector>
+#include <time.h>
 
 // The bridge lives inside the Proton/Wine process, where nr::pe::log writes
 // to dlssnr-amd.log. Every message is prefixed with "[nr] gamescope:" so it
@@ -36,6 +37,12 @@ void Bridge::shutdown() {}
 namespace nr::pe::gamescope {
 namespace {
 using nr::pe::log;
+
+inline uint64_t get_bridge_time_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
 }
 
 // ─── construction / destruction ───────────────────────────────────────────────
@@ -567,7 +574,16 @@ VkImage Bridge::process_frame(Session& session, VkCommandBuffer cmd,
 
     // ── run the Mochizuki NR network ──
     DeviceHandles h = handles_;
+    uint64_t t_fg_start = get_bridge_time_ns();
     VkImage result = session.run_vulkan(h, cmd, bridge_frame, controls);
+    uint64_t t_fg_end = get_bridge_time_ns();
+    uint64_t fg_dur_ns = t_fg_end - t_fg_start;
+
+    log("[Telemetry Timing] Frame Generation: FrameID: %llu, Duration: %.3f ms (%llu ns), start: %llu ns, end: %llu ns, status: %s",
+        (unsigned long long)offer.frame_id,
+        fg_dur_ns / 1'000'000.0, (unsigned long long)fg_dur_ns,
+        (unsigned long long)t_fg_start, (unsigned long long)t_fg_end,
+        result ? "SUCCESS" : "DECLINED/BUILDING");
 
     if (verbose_) {
         log("[nr] gamescope: Mochizuki run_vulkan%s",

@@ -10,12 +10,19 @@
 #include <cstdarg>
 #include <cstdio>
 #include <vector>
+#include <time.h>
 
 // The host lives in Gamescope's native Linux process. It has no access to
 // nr::pe::log (which writes through Wine's file API), so it logs to stderr
 // where Gamescope's own messages go.
 
 namespace {
+inline uint64_t get_time_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
 void host_log(const char* format, ...) {
     va_list args;
     va_start(args, format);
@@ -430,13 +437,26 @@ bool Host::receive_result(VkCommandBuffer cmd, VkImage target,
     int fds[kMaxFds];
     uint32_t fd_count = 0;
 
-    // Block briefly waiting for the result.
+    // Block briefly waiting for the result. Use 1ms timeout during video/fallback mode to avoid FPS drops.
+    uint64_t t_ipc_poll_start = get_time_ns();
     pollfd pfd{};
     pfd.fd = client_fd_;
     pfd.events = POLLIN;
-    int poll_res = poll(&pfd, 1, 16 /* ~1 frame at 60 Hz */);
-    if (poll_res <= 0)
+    int timeout_ms = (consecutive_timeouts_ >= 2) ? 1 : 16;
+    int poll_res = poll(&pfd, 1, timeout_ms);
+    uint64_t t_ipc_poll_end = get_time_ns();
+    uint64_t ipc_sync_dur_ns = t_ipc_poll_end - t_ipc_poll_start;
+
+    if (poll_res <= 0) {
+        consecutive_timeouts_++;
+        host_log("[Telemetry Timing] IPC Synchronization TIMEOUT/FAIL (count: %u, timeout: %d ms): Duration: %.3f ms (%llu ns), start: %llu ns, end: %llu ns, poll_res: %d (errno: %d)",
+                 consecutive_timeouts_, timeout_ms,
+                 ipc_sync_dur_ns / 1'000'000.0, (unsigned long long)ipc_sync_dur_ns,
+                 (unsigned long long)t_ipc_poll_start, (unsigned long long)t_ipc_poll_end,
+                 poll_res, errno);
         return false;
+    }
+    consecutive_timeouts_ = 0;
 
     if (pfd.revents & (POLLHUP | POLLERR)) {
         host_log("[nr] gamescope: client disconnected (hup/err)");
@@ -453,6 +473,12 @@ bool Host::receive_result(VkCommandBuffer cmd, VkImage target,
         active_ = false;
         return false;
     }
+
+    host_log("[Telemetry Timing] IPC Synchronization: FrameID: %llu, Duration: %.3f ms (%llu ns), start: %llu ns, end: %llu ns, poll_res: %d",
+             (unsigned long long)result_msg.frame_id,
+             ipc_sync_dur_ns / 1'000'000.0, (unsigned long long)ipc_sync_dur_ns,
+             (unsigned long long)t_ipc_poll_start, (unsigned long long)t_ipc_poll_end,
+             poll_res);
 
     int mem_fd = fds[0];
     int sem_fd = fd_count >= 2 ? fds[1] : -1;

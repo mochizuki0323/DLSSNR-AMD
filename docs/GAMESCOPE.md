@@ -114,3 +114,20 @@ Tested and validated on hardware:
 - OptiScaler initialized via `dlssnr_core.dll` (`dxgi.dll` hook).
 - Verified concurrent execution with AMD FidelityFX Frame Generation (`FGInput=dlssg`, `FGOutput=fsrfg`).
 - Confirmed zero compositor stalls on handshake miss or disconnect.
+
+---
+
+## Cutscene & Video Treatment Architecture
+
+Cutscenes present unique architectural challenges across modern game engines:
+
+### 1. In-Engine 3D Cutscenes (Format Bridge)
+- **Challenge**: The game engine often switches color buffer formats when entering or exiting in-engine cinematic sequences (e.g. `R11G11B10_FLOAT` to/from `R16G16B16A16_FLOAT`). Normally, this would trigger an expensive pipeline recompilation (~4.7s) causing freezes or black frames.
+- **Solution (`Format Bridge`)**: Implemented companion-format bridge in `nr_pe_session.cpp`. When a format change is detected, requests are dynamically served through the resident network while proactively compiling the companion model in a background worker thread. Once built, it switches seamlessly to native execution without any stutter or frame drop.
+
+### 2. Pre-Rendered FMVs & Video Briefings (Compositor Spatial Fallback)
+- **Challenge**: Pre-rendered 2D videos (Bink Video, Media Player) bypass the game's 3D upscaler entirely (*"Upscaler is not active"* in OptiScaler). Since no motion vectors or depth buffers exist, temporal neural reconstruction cannot be evaluated inside the game.
+- **Solution (`Spatial Fallback`)**: 
+  - Gamescope enforces active Vulkan composition (`cv_composite_force = true`) when `NR_GAMESCOPE_BRIDGE=1`, preventing Wayland direct scanout bypass.
+  - When the DLSS-NR Host is idle or disconnected (video mode), Gamescope immediately routes Layer 0 to a dedicated Spatial Fallback pass using AMD FSR Edge Adaptive Spatial Upsampling (EASU) and Robust Contrast Adaptive Sharpening (RCAS $\ge$ 0.5).
+  - This ensures that 100% of video cutscenes and briefing screens receive real-time edge refinement and contrast enhancement at the display level.

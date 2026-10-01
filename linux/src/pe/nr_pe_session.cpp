@@ -212,10 +212,32 @@ struct Session::Impl {
     // Make `entry` the one the run paths use. Returns false when there is no
     // such entry.
     bool select_runtime(uint32_t w, uint32_t h, VkFormat format, bool want_linear);
+    bool select_bridge_runtime(uint32_t w, uint32_t h, VkFormat format, bool want_linear);
+    void trigger_build(const Controls& controls, uint32_t w, uint32_t h, VkFormat format, bool want_linear);
     bool have_runtime(uint32_t w, uint32_t h) const {
         for (const auto& e : cache) if (e.width == w && e.height == h) return true;
         return false;
     }
+    bool have_runtime_format(uint32_t w, uint32_t h, VkFormat f) const {
+        for (const auto& e : cache) if (e.width == w && e.height == h && e.format == f) return true;
+        return false;
+    }
+
+    // Format bridge for instant cutscene and scene transition support without passthrough
+    VkImage bridge_image{};
+    VkDeviceMemory bridge_memory{};
+    uint32_t bridge_w{}, bridge_h{};
+    VkFormat bridge_format{VK_FORMAT_UNDEFINED};
+    bool bridged{false};
+    VkFormat bridged_target_format{VK_FORMAT_UNDEFINED};
+    bool ensure_bridge(uint32_t w, uint32_t h, VkFormat fmt);
+    void release_bridge();
+
+    // Dual format proactive warm-up queue
+    VkFormat warmup_format{VK_FORMAT_UNDEFINED};
+    uint32_t warmup_w{}, warmup_h{};
+    bool warmup_linear{};
+
     // Free least-recently-used entries until the card can hold another network
     // at this extent. False means it cannot hold one even with the cache empty.
     bool make_room(uint32_t w, uint32_t h);
@@ -294,6 +316,84 @@ bool Session::Impl::ensure_vk_output(uint32_t w, uint32_t h, VkFormat format) {
     }
     vk_w = w; vk_h = h; vk_format = format;
     return true;
+}
+
+void Session::Impl::release_bridge() {
+    if (bridge_image) {
+        vkDestroyImage(handles.device, bridge_image, nullptr);
+        bridge_image = VK_NULL_HANDLE;
+    }
+    if (bridge_memory) {
+        vkFreeMemory(handles.device, bridge_memory, nullptr);
+        bridge_memory = VK_NULL_HANDLE;
+    }
+    bridge_w = bridge_h = 0;
+    bridge_format = VK_FORMAT_UNDEFINED;
+}
+
+bool Session::Impl::ensure_bridge(uint32_t w, uint32_t h, VkFormat format) {
+    if (bridge_image && bridge_w == w && bridge_h == h && bridge_format == format)
+        return true;
+    release_bridge();
+    VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ci.imageType = VK_IMAGE_TYPE_2D;
+    ci.format = format;
+    ci.extent = {w, h, 1};
+    ci.mipLevels = ci.arrayLayers = 1;
+    ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+               VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(handles.device, &ci, nullptr, &bridge_image) != VK_SUCCESS) {
+        status = "could not create the format bridge image";
+        return false;
+    }
+    VkMemoryRequirements req{};
+    vkGetImageMemoryRequirements(handles.device, bridge_image, &req);
+    VkPhysicalDeviceMemoryProperties mem{};
+    vkGetPhysicalDeviceMemoryProperties(handles.physical, &mem);
+    uint32_t type = mem.memoryTypeCount;
+    for (uint32_t i = 0; i < mem.memoryTypeCount; ++i) {
+        if ((req.memoryTypeBits & (1u << i)) &&
+            (mem.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+            type = i;
+            break;
+        }
+    }
+    if (type == mem.memoryTypeCount) {
+        release_bridge();
+        status = "no device-local memory for bridge";
+        return false;
+    }
+    VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    alloc.allocationSize = req.size;
+    alloc.memoryTypeIndex = type;
+    if (vkAllocateMemory(handles.device, &alloc, nullptr, &bridge_memory) != VK_SUCCESS ||
+        vkBindImageMemory(handles.device, bridge_image, bridge_memory, 0) != VK_SUCCESS) {
+        release_bridge();
+        status = "could not back the bridge image";
+        return false;
+    }
+    bridge_w = w;
+    bridge_h = h;
+    bridge_format = format;
+    return true;
+}
+
+static void transition_layout(VkCommandBuffer cmd, VkImage image,
+                              VkImageLayout old_layout, VkImageLayout new_layout,
+                              VkAccessFlags src_access, VkAccessFlags dst_access,
+                              VkPipelineStageFlags src_stage, VkPipelineStageFlags dst_stage) {
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcAccessMask = src_access;
+    b.dstAccessMask = dst_access;
+    b.oldLayout = old_layout;
+    b.newLayout = new_layout;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = image;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, src_stage, dst_stage, 0, 0, nullptr, 0, nullptr, 1, &b);
 }
 
 bool Session::Impl::wait_for_own_cmd() {
@@ -472,15 +572,40 @@ bool Session::Impl::select_runtime(uint32_t w, uint32_t h, VkFormat format, bool
             e.scale != model_scale || e.passes != max_passes_want || e.prep != prep_want)
             continue;
         e.used = ++use_stamp;
-        if (runtime != e.runtime.get()) {
-            log("[nr] runtime cache hit: %ux%u (model %ux%u, scale %.2f%s), %u built, "
-                "%u live features", e.width, e.height, e.runtime->model_width(),
+        if (runtime != e.runtime.get() || bridged) {
+            log("[nr] runtime cache hit: %ux%u fmt %u (model %ux%u, scale %.2f%s), %u built, "
+                "%u live features", e.width, e.height, unsigned(e.format), e.runtime->model_width(),
                 e.runtime->model_height(), e.scale, e.linear ? ", linear" : "",
                 unsigned(cache.size()), e.runtime->live_features());
         }
         runtime = e.runtime.get();
         width = e.width; height = e.height; this->format = e.format;
         linear = e.linear; built_scale = e.scale;
+        bridged = false;
+        return true;
+    }
+    return false;
+}
+
+bool Session::Impl::select_bridge_runtime(uint32_t w, uint32_t h, VkFormat format, bool want_linear) {
+    for (auto& e : cache) {
+        if (e.width != w || e.height != h || e.scale != model_scale || e.prep != prep_want)
+            continue;
+        const bool both_linear = is_linear_format(e.format) && is_linear_format(format);
+        const bool both_unorm = !is_linear_format(e.format) && !is_linear_format(format);
+        if (!both_linear && !both_unorm)
+            continue;
+
+        e.used = ++use_stamp;
+        if (runtime != e.runtime.get() || !bridged || bridged_target_format != format) {
+            log("[nr] format bridge active: serving request %ux%u fmt %u through resident network fmt %u",
+                w, h, unsigned(format), unsigned(e.format));
+        }
+        runtime = e.runtime.get();
+        width = e.width; height = e.height; this->format = e.format;
+        linear = e.linear; built_scale = e.scale;
+        bridged = true;
+        bridged_target_format = format;
         return true;
     }
     return false;
@@ -526,6 +651,54 @@ bool Session::Impl::ensure_runtime(const Controls& controls, uint32_t w, uint32_
     return ok;
 }
 
+void Session::Impl::trigger_build(const Controls& controls, uint32_t w, uint32_t h, VkFormat format,
+                                  bool want_linear) {
+    if (building) return;
+    if (!make_room(w, h)) return;
+    RuntimeConfig config;
+    config.root = root; config.width = w; config.height = h; config.colour_format = format;
+    config.linear_input = want_linear; config.white_point = white_point;
+    config.model_scale = model_scale;
+    config.max_passes = native_compose ? 1u : max_passes_want;
+    config.native_compose = native_compose;
+    config.preprocess = prep_want;
+    config.preprocess_unknee = want_linear || (native_compose && is_linear_format(format));
+    if (native_compose) config.model_scale = 1.0f;
+    TemporalConfig temporal; temporal.enable = true;
+    temporal.history_strength = history_strength;
+    HostDevice host{};
+    host.instance = handles.instance; host.physical = handles.physical; host.device = handles.device;
+    host.queue = access.queue; host.queue_family = access.family;
+    const QueueAccess access_copy = access;
+    building = true; build_w = w; build_h = h; build_format = format; build_linear = want_linear;
+    build_scale = model_scale; build_passes = max_passes_want; build_prep = prep_want;
+    status = "building the network in the background; frames pass through until it is ready";
+    log("[nr] building the network at %ux%u fmt %u (model scale %.2f) in the background%s", w, h,
+        unsigned(format), model_scale,
+        want_linear ? " (linear-light colour: encoding with a white point, see dlssnr-amd.ini white_point)" : "");
+    build_thread = std::thread([this, host, config, temporal, access_copy] {
+        const auto t0 = std::chrono::steady_clock::now();
+        std::unique_ptr<Runtime> made;
+        std::string error;
+        bool oom = false;
+        try {
+            HostDevice locked = host;
+            locked.queue_lock = access_copy.lock_quiet;
+            locked.queue_unlock = access_copy.unlock_quiet;
+            made = std::make_unique<Runtime>(locked, config, ControlMaskConfig{}, temporal);
+        } catch (const std::bad_alloc&) {
+            oom = true;
+            error = "neural rendering unavailable: out of host memory. " + address_space_report();
+        } catch (const std::exception& e) {
+            error = std::string("neural rendering unavailable: ") + e.what();
+        }
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::lock_guard<std::mutex> guard(build_lock);
+        built = std::move(made); build_error = error; build_seconds = seconds; build_done = true;
+        build_oom = oom;
+    });
+}
+
 bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32_t h, VkFormat format,
                                     bool want_linear) {
     if (controls.preprocess.active() && !prep_want) {
@@ -551,9 +724,6 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
                     entry.runtime->model_height(), entry.scale, access.family, build_seconds,
                     entry.linear ? "; the colour is linear light and is encoded for the network" : "",
                     unsigned(cache.size() + 1));
-                // A network built without the preprocess at this extent is
-                // never selected again; its memory goes now. Its last frame
-                // was before this build started, a second or more ago.
                 for (size_t i = cache.size(); i-- > 0;)
                     if (entry.prep && !cache[i].prep && cache[i].width == entry.width &&
                         cache[i].height == entry.height)
@@ -563,16 +733,29 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
                 runtime = adopted.runtime.get();
                 width = adopted.width; height = adopted.height; this->format = adopted.format;
                 linear = adopted.linear; built_scale = adopted.scale;
+                bridged = false;
                 oom_failures = 0;
                 retry_at = {};
+
+                // Proactive dual format warm-up:
+                VkFormat counterpart = VK_FORMAT_UNDEFINED;
+                if (adopted.format == VK_FORMAT_B10G11R11_UFLOAT_PACK32)
+                    counterpart = VK_FORMAT_R16G16B16A16_SFLOAT;
+                else if (adopted.format == VK_FORMAT_R16G16B16A16_SFLOAT)
+                    counterpart = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+
+                if (counterpart != VK_FORMAT_UNDEFINED && !have_runtime_format(adopted.width, adopted.height, counterpart)) {
+                    warmup_w = adopted.width;
+                    warmup_h = adopted.height;
+                    warmup_format = counterpart;
+                    warmup_linear = adopted.linear;
+                    log("[nr] queued background warm-up for companion format %u at %ux%u",
+                        unsigned(counterpart), adopted.width, adopted.height);
+                }
             } else {
                 status = build_error;
                 log("[nr] %s", status.c_str());
                 if (build_oom && oom_failures < kOomRetries) {
-                    // 4, 8, 16, 32 seconds. Long enough that the load or the
-                    // resolution change that took the address space has
-                    // finished, short enough that a player does not give up on
-                    // the feature first.
                     const unsigned wait = 4u << oom_failures;
                     ++oom_failures;
                     retry_at = std::chrono::steady_clock::now() + std::chrono::seconds(wait);
@@ -585,96 +768,50 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
             }
         }
     }
+
     if (select_runtime(w, h, format, want_linear)) return true;
+
+    // Trigger exact native build in background if not already running:
+    if (!building) {
+        if (!access.valid()) {
+            status = "no submittable queue on the game's device; the weights cannot be uploaded";
+            failed = true;
+            return false;
+        }
+        if (retry_at != std::chrono::steady_clock::time_point{}) {
+            if (std::chrono::steady_clock::now() < retry_at) {
+                status = build_error;
+                return false;
+            }
+            retry_at = {};
+        }
+        trigger_build(controls, w, h, format, want_linear);
+    }
+
+    // While native build is compiling in background, if we have a resident network
+    // at the same resolution, serve the frame immediately via format bridge!
+    if (select_bridge_runtime(w, h, format, want_linear)) {
+        return true;
+    }
+
+    // If idle and warm-up format is queued, trigger companion format warm-up:
+    if (!building && warmup_format != VK_FORMAT_UNDEFINED) {
+        if (!have_runtime_format(warmup_w, warmup_h, warmup_format) && fits_in_memory(warmup_w, warmup_h)) {
+            const VkFormat wf = warmup_format;
+            const uint32_t ww = warmup_w, wh = warmup_h;
+            const bool wl = warmup_linear;
+            warmup_format = VK_FORMAT_UNDEFINED;
+            log("[nr] starting background warm-up build for format %u at %ux%u", unsigned(wf), ww, wh);
+            trigger_build(controls, ww, wh, wf, wl);
+        } else {
+            warmup_format = VK_FORMAT_UNDEFINED;
+        }
+    }
+
     if (building) {
         status = "building the network in the background; frames pass through until it is ready";
         return false;
     }
-    if (!access.valid()) {
-        status = "no submittable queue on the game's device; the weights cannot be uploaded";
-        failed = true;
-        return false;
-    }
-    // A host-memory failure is waiting out its backoff; the frame passes through
-    // with the reason still in `status`, exactly as it does while a build runs.
-    if (retry_at != std::chrono::steady_clock::time_point{}) {
-        if (std::chrono::steady_clock::now() < retry_at) {
-            status = build_error;
-            return false;
-        }
-        retry_at = {};
-    }
-    // Checked before anything is allocated, and not treated as a hard failure:
-    // a smaller extent may well fit later, and a game changing resolution is
-    // exactly when that happens. Cached networks at other extents are given up
-    // one at a time, oldest first, until this one fits.
-    if (!make_room(w, h)) return false;
-    RuntimeConfig config;
-    config.root = root; config.width = w; config.height = h; config.colour_format = format;
-    config.linear_input = want_linear; config.white_point = white_point;
-    config.model_scale = model_scale;
-    config.max_passes = native_compose ? 1u : max_passes_want;
-    config.native_compose = native_compose;
-    config.preprocess = prep_want;
-    // The soft knee to undo: the linear path's own encode, or OptiScaler's
-    // linear-HDR encode, which a float proxy on the OptiScaler route came
-    // through (OptiScaler encodes a float colour flagged IsHDR or AutoExposure
-    // and hands an SDR one over as it is, and only the format reaches us).
-    config.preprocess_unknee = want_linear || (native_compose && is_linear_format(format));
-    if (native_compose) config.model_scale = 1.0f;   // the DLL has no resample; OptiScaler scales outside
-    TemporalConfig temporal; temporal.enable = true;
-    temporal.history_strength = history_strength;
-    HostDevice host{};
-    host.instance = handles.instance; host.physical = handles.physical; host.device = handles.device;
-    // A real queue and its real family. Construction submits the weight upload
-    // and waits for it; the game is submitting to the same underlying VkQueue,
-    // so each of those submits takes the queue lock (below).
-    host.queue = access.queue; host.queue_family = access.family;
-    // Off the render thread. Building reads the weights, creates every pipeline
-    // and allocates the arena, and doing that inside the upscaler's call froze
-    // the game for the duration every time the feature was first turned on. The
-    // queue lock is a mutex and is taken from this thread exactly as it would be
-    // from the render thread; the game keeps rendering unenhanced frames until
-    // the build is adopted above.
-    const QueueAccess access_copy = access;
-    building = true; build_w = w; build_h = h; build_format = format; build_linear = want_linear;
-    build_scale = model_scale; build_passes = max_passes_want; build_prep = prep_want;
-    status = "building the network in the background; frames pass through until it is ready";
-    log("[nr] building the network at %ux%u (model scale %.2f) in the background%s", w, h, model_scale,
-        want_linear ? " (linear-light colour: encoding with a white point, see dlssnr-amd.ini white_point)" : "");
-    build_thread = std::thread([this, host, config, temporal, access_copy] {
-        const auto t0 = std::chrono::steady_clock::now();
-        std::unique_ptr<Runtime> made;
-        std::string error;
-        bool oom = false;
-        try {
-            // The queue lock around each submit of the build, not around the
-            // build: held for the whole of it, the pipeline compile (7.75 s cold
-            // at 4K, S.T.A.L.K.E.R. 2) blocked vkd3d's own submissions and
-            // presents on the shared queue, and the game froze for as long
-            // (an 8.4 s frame). **Quiet**: this is not the render thread, and
-            // the flush half of the other lock drives DXVK's immediate context,
-            // which that thread owns. See QueueAccess::lock_quiet.
-            HostDevice locked = host;
-            locked.queue_lock = access_copy.lock_quiet;
-            locked.queue_unlock = access_copy.unlock_quiet;
-            made = std::make_unique<Runtime>(locked, config, ControlMaskConfig{}, temporal);
-        } catch (const std::bad_alloc&) {
-            // Caught apart from everything else because it is the one failure
-            // that is about the *host* and is worth retrying. `what()` here is
-            // the useless string "std::bad_alloc"; what a reader needs is how
-            // much address space was left, and the build's own log lines above
-            // say what it had just asked for.
-            oom = true;
-            error = "neural rendering unavailable: out of host memory. " + address_space_report();
-        } catch (const std::exception& e) {
-            error = std::string("neural rendering unavailable: ") + e.what();
-        }
-        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        std::lock_guard<std::mutex> guard(build_lock);
-        built = std::move(made); build_error = error; build_seconds = seconds; build_done = true;
-        build_oom = oom;
-    });
     return false;
 }
 
@@ -951,6 +1088,7 @@ Session::~Session() {
     impl_->release_output();
     impl_->release_invalidator();
     impl_->release_vk_output();
+    impl_->release_bridge();
     if (impl_->pool) vkDestroyCommandPool(impl_->handles.device, impl_->pool, nullptr);
     if (impl_->owned_queue) impl_->owned_queue->Release();
     if (impl_->dxvk) impl_->dxvk->Release();
@@ -971,6 +1109,7 @@ const std::string& Session::status() const { return impl_->status; }
 
 bool Session::building() const { return impl_->building; }
 bool Session::failed() const { return impl_->failed; }
+bool Session::is_bridged() const { return impl_->bridged; }
 
 // The runtime that is actually running frames, not the one being built: during a
 // rebuild the old one is still the one paying for the picture on screen.
@@ -1115,6 +1254,97 @@ bool Session::run_after(ID3D12Device* device, ID3D12GraphicsCommandList* list,
     if (!s.ensure_runtime(controls, target.width, target.height, target.format,
                           !resources.colour_encoded &&
                               Session::Impl::is_linear_format(target.format))) return false;
+
+    // Format bridge branch: instant execution when resident network format differs from target (e.g. cutscenes)
+    if (s.bridged) {
+        if (!s.ensure_bridge(target.width, target.height, s.format)) return false;
+
+        transition_layout(cmd, target.image, target.layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                          VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                          VK_ACCESS_TRANSFER_READ_BIT,
+                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+        transition_layout(cmd, s.bridge_image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                          0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+        VkImageBlit blit{};
+        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blit.srcOffsets[1] = {int32_t(target.width), int32_t(target.height), 1};
+        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blit.dstOffsets[1] = {int32_t(target.width), int32_t(target.height), 1};
+        vkCmdBlitImage(cmd, target.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       s.bridge_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+
+        transition_layout(cmd, s.bridge_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                          VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+
+        ColourFrame frame{};
+        frame.image = s.bridge_image;
+        frame.format = s.format;
+        frame.width = target.width; frame.height = target.height;
+        frame.before = frame.after = VK_IMAGE_LAYOUT_GENERAL;
+        frame.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+
+        EngineFrame engine{};
+        engine.colour = frame;
+        engine.feature = resources.feature;
+        engine.reset = resources.reset;
+        engine.motion_scale_x = resources.motion_scale_x;
+        engine.motion_scale_y = resources.motion_scale_y;
+        engine.depth_inverted = resources.depth_inverted;
+        const bool motion_vk = resources.motion &&
+            fill(&engine.motion, resource_handle(device, resources.motion, resources.motion_state));
+        if (motion_vk) {
+            engine.motion_texture_width = engine.motion.width; engine.motion_texture_height = engine.motion.height;
+            apply_guide_subrect(&engine.motion, resources.motion_subrect, "motion-vector", &engine.motion_x, &engine.motion_y);
+        }
+        if (resources.depth &&
+            fill(&engine.depth, resource_handle(device, resources.depth, resources.depth_state)))
+            apply_guide_subrect(&engine.depth, resources.depth_subrect, "depth", &engine.depth_x, &engine.depth_y);
+
+        const auto everything = [&](VkAccessFlags src_access, VkAccessFlags dst_access) {
+            VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            mb.srcAccessMask = src_access; mb.dstAccessMask = dst_access;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                 0, 1, &mb, 0, nullptr, 0, nullptr);
+        };
+        everything(VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        try {
+            if (motion_vk) s.runtime->record_engine(cmd, engine, controls);
+            else s.runtime->record(cmd, frame, controls);
+        } catch (const std::exception& e) {
+            s.status = std::string("neural rendering failed: ") + e.what();
+            s.failed = true;
+            log("[nr] %s", s.status.c_str());
+            return false;
+        }
+        everything(VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+
+        transition_layout(cmd, s.bridge_image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                          VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+        transition_layout(cmd, target.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                          VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+        vkCmdBlitImage(cmd, s.bridge_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       target.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+
+        transition_layout(cmd, target.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, target.layout,
+                          VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+
+        list->SetPipelineState(nullptr);
+        list->SetComputeRootSignature(nullptr);
+        s.forget_bound_pipeline(device, list);
+        return true;
+    }
 
     // In place: the upscaler already wrote this and nobody is waiting for a
     // different resource, so there is nothing to rebind.

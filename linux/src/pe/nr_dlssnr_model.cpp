@@ -153,7 +153,7 @@ void log_evaluate(Feature* f, const char* api, unsigned int w, unsigned int h, c
     if (gpu_ms > 0.0f) std::snprintf(cost, sizeof cost, ", %.2f ms", gpu_ms);
     log("[nr] evaluate #%u (%s, %u) %ux%u in=%p out=%p reset=%d owner=1%s -> %s%s%s",
         static_cast<unsigned>(f->id), api, static_cast<unsigned>(n), w, h, in,
-        out, reset ? 1 : 0, cost, ran ? "ran" : "passthrough(", ran ? "" : (why ? why : "unknown"),
+        out, reset ? 1 : 0, cost, ran ? (why ? why : "ran") : "passthrough(", ran ? "" : (why ? why : "unknown"),
         ran ? "" : ")");
 }
 
@@ -1124,7 +1124,7 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
     // unenhanced frame: that is a Success with a passthrough in the log, exactly as the reference
     // behaves while NGX is still initialising. Only Session::failed() - a hard, latched fault - is
     // worth telling the host about, because only that one will not fix itself.
-    const char* why = ran ? nullptr
+    const char* why = ran ? (session.is_bridged() ? "ran(bridged)" : nullptr)
                       : skipped ? "skipped(NR_DEBUG_SKIP_PASS)"
                       : session.failed() ? "failed"
                       : session.building() ? "building" : "declined";
