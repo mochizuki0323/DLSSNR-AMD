@@ -43,7 +43,7 @@ struct alignas(8) HandshakeMsg {
     uint32_t max_width;
     uint32_t max_height;
     VkExternalMemoryHandleTypeFlags external_memory_handle_types;
-    uint32_t padding; // Ensure 8-byte alignment overall
+    uint32_t in_engine_nr_active; // 1 if OptiScaler/in-engine NR is active, 0 for pure compositor capture
 };
 
 // Provides explicit rejection paths avoiding silent stalls on capability mismatches.

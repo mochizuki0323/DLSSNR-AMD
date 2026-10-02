@@ -186,7 +186,9 @@ bool Host::accept_connection() {
     }
 
     active_ = true;
-    host_log("[nr] gamescope: client connected, same GPU validated");
+    in_engine_nr_active_ = (hs.in_engine_nr_active != 0);
+    host_log("[nr] gamescope: client connected, same GPU validated (in_engine_nr_active=%d)",
+             int(in_engine_nr_active_));
     return true;
 }
 

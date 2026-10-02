@@ -168,6 +168,7 @@ bool Bridge::connect() {
     hs.max_height = props2.properties.limits.maxImageDimension2D;
     hs.external_memory_handle_types =
         VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    hs.in_engine_nr_active = 1; // OptiScaler in-engine capture & NR active
 
     if (!send_message(sock_fd_, MessageType::MSG_HANDSHAKE,
                       &hs, sizeof(hs), nullptr, 0)) {
