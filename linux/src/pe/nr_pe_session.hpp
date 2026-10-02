@@ -251,6 +251,8 @@ class Session {
     // Has something gone wrong that will not fix itself? This, and only this, is
     // a failure.
     bool failed() const;
+    // Is the session running via the format bridge (e.g. cutscene format adaptation)?
+    bool is_bridged() const;
 
     // Wait for any work this session has in flight. Called before anything it
     // may still be reading is destroyed - a retiring swapchain above all, whose

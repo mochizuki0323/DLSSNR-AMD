@@ -61,6 +61,8 @@ the add-on gets a real `VkDevice`. That needs three pieces of plumbing:
 
 Native Vulkan games use the same route: ReShade as a layer under the game's own Vulkan device.
 
+**`gamescope` route.** For games running inside the Gamescope compositor, a native Vulkan Host (`nr::pe::gamescope::Host`) runs directly within Gamescope's render pipeline (`vulkan_composite`). The Host intercepts the composited layer texture, exports it via `VK_KHR_external_memory_fd` and synchronises with `VK_KHR_external_semaphore_fd`, and exchanges it with OptiScaler's guest bridge (`nr::pe::gamescope::Bridge`) over a Unix Domain Socket in `/tmp`. The network runs zero-copy on the GPU across the process and container boundary, returning the processed frame directly for Gamescope presentation. Details in [GAMESCOPE.md](GAMESCOPE.md).
+
 **Windows.** A native D3D game on Windows has no Vulkan device underneath it, and running the network
 on a separate device would mean sharing or copying the frame between two APIs every frame. So the
 Windows package puts DXVK and vkd3d-proton (from GE-Proton) into the game folder and the game runs on
