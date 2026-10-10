@@ -74,6 +74,7 @@ layout(set = 0, binding = 2, std430) NR_COH readonly buffer ActE4M3x4 { fe4m3vec
 layout(set = 0, binding = 2, std430) NR_COH readonly buffer ActE4M3u { uint act_u2[]; };
 #define nr_act4(i) uintBitsToFloate4m3EXT(unpack8(act_u2[i]))
 
+#define NR_TC_WBIND 1   // NR_TCHAIN reads its records from the weight buffer
 #include "nr_chain.glsl"
 layout(push_constant) uniform Push {
     uint x_off;      // the QKV output: [tokens][3*NR_C], e4m3, tile-blocked
@@ -83,6 +84,7 @@ layout(push_constant) uniform Push {
     uint mode;       // bit 0 cosine-normalise, bit 1 interleave, bit 2 quantise P
     uint act_lo, act_hi;   // the activation arena's device address (NR_VBDA; host PushVAttn)
     NR_CHAIN_FIELDS
+    NR_TCHAIN_FIELDS
 } pc;
 
 uint nr_at(uint base, uint token, uint ch, uint C) {
@@ -410,6 +412,7 @@ shared float   lds_ki[NR_KC];          // per-key 1/||k||
 void main() {
     NR_PROF_BEGIN()
     nr_chain_wait()
+    NR_TC_PROLOGUE
     const uint q0 = gl_WorkGroupID.x * uint(NR_QT);
     const uint head = gl_WorkGroupID.y;
     const uint lane = gl_LocalInvocationID.x;
@@ -864,5 +867,7 @@ void main() {
             }
 #endif  // NR_VTRANS
     nr_chain_signal()
+    // NR_TCHAIN: this head's columns of the query tile's token tiles are written.
+    nr_tchain_signal_wave(q0 / 16u, min(uint(NR_QT) / 16u, (pc.tokens + 15u) / 16u - q0 / 16u))
     NR_PROF_END(pc.o_off)
 }

@@ -25,6 +25,9 @@ void set_module(void* module);
 // could not be resolved, which is not a case that has been seen.
 const char* module_folder();
 
+// [Log] in dlssnr-amd.ini, read before the first line: Enabled = 0 writes nothing (and log() returns
+// at once); ClearOnStart = 1 (the default) starts the file afresh at each launch.
+//
 // Append one line. Safe before anything else is initialised - this is called
 // from DllMain, on purpose, so that the file's existence proves the module
 // loaded even if every later step fails.

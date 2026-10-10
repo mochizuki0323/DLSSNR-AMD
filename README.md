@@ -17,8 +17,11 @@ graphics cards.
   pictures and data: [docs/ngx-verification](docs/ngx-verification/NGX-VERIFICATION.md).
 - **Tested only on an RX 9070 XT.** Other cards are not guaranteed to work.
 - **The Windows version is an experimental preview and has not been tested much.** Game crashes,
-  driver resets and other unexpected problems can happen, and it is slower than Linux. See
-  [Windows](#windows-experimental-preview).
+  driver resets and other unexpected problems can happen. With its default settings the network is
+  slower than on Linux. With [ACO Mode](#windows-experimental-preview) it loads machine code that was
+  made in advance with Mesa's ACO compiler (the Linux driver's compiler) and ships in the package, and
+  comes close to Linux (see [Performance](#performance)). ACO Mode has been tested on one driver version only (AMD Software
+  26.9.2); see [Windows](#windows-experimental-preview).
 
 This is an independent project. It is not affiliated with, endorsed by or supported by NVIDIA or
 AMD. DLSS is a trademark of NVIDIA Corporation.
@@ -54,7 +57,7 @@ these logs:
 | Platform | Needs | State |
 | --- | --- | --- |
 | **Linux** (Steam / Proton) | Mesa 26.2 or newer, GE-Proton 11-7 (tested) | The main version, used in games. |
-| **Windows** | AMD Software 25.10 or newer | **Experimental preview, not tested much.** Slower than Linux; game crashes, driver resets and other problems can happen. |
+| **Windows** | AMD Software 26.9.2 (tested) | **Experimental preview, not tested much.** Slower than Linux by default, close to it with ACO Mode; game crashes, driver resets and other problems can happen. |
 
 Both need an RX 9000 series (RDNA4) card; older cards (RX 7000 and earlier) lack the FP8 matrix
 instructions the network needs.
@@ -62,13 +65,15 @@ instructions the network needs.
 ## Performance
 
 GPU time of the network per frame on an RX 9070 XT, **offline benchmark** (network only), measured
-with v0.0.3 (the int4 mixed row with v0.0.4):
+with v0.0.3 (the int4 mixed row with v0.0.4, the Windows ACO Mode row with v0.0.4-win-preview on
+AMD Software 26.9.2):
 
 | | 1080p | 1440p | 4K |
 | --- | --- | --- | --- |
 | Linux | 5.60 ms | 9.70 ms | 21.89 ms |
 | Linux, [int4 mixed](#int4-mixed-optional-linux) | 4.99 ms | 8.69 ms | 19.64 ms |
 | Windows | 7.21 ms | 12.59 ms | 27.32 ms |
+| Windows, [ACO Mode](#windows-experimental-preview) On | 5.70 ms | 9.96 ms | 22.49 ms |
 
 In game (Linux, RX 9070 XT):
 
@@ -99,7 +104,7 @@ None of these measurements use frame generation; the OptiScaler route can turn i
 | Game uses | Linux | Windows |
 | --- | --- | --- |
 | **DirectX 12** | `optiscaler` if the game has DLSS/FSR/XeSS, otherwise `reshade` | OptiScaler or ReShade |
-| **DirectX 11** | `optiscaler` if the game has DLSS/FSR/XeSS, otherwise `reshade` | ReShade only |
+| **DirectX 11** | `optiscaler` if the game has DLSS/FSR/XeSS, otherwise `reshade` | OptiScaler or ReShade |
 | **DirectX 10** | `reshade` | ReShade |
 | **DirectX 9** | `dx9` | ReShade (DX9) |
 | **Vulkan** | `vulkan` | ReShade |
@@ -254,21 +259,35 @@ resets and other unexpected problems can happen. It is built from the same code 
 and changed only where the AMD Windows driver needs it. It is updated less often than the Linux
 version, and some releases may be Linux only.
 
+DirectX 10/11/12 games keep the system's own D3D. NR runs on a Vulkan device of its own on the same
+card, and each frame is handed between the two through shared textures and a shared fence, on the
+GPU. DirectX 9 games run on Vulkan through DXVK, because D3D9 cannot share a frame with another API.
+
+**ACO Mode.** `[Network] ACO Mode` in `dlssnr-amd.ini` chooses where the network's machine code comes
+from. Off (`ACO Mode = 0`, the default): the AMD driver compiles the network. On (`ACO Mode = 1`): the
+package carries the network as machine code made in advance with Mesa's ACO compiler (the Linux
+driver's compiler), and the AMD driver loads that code instead of compiling the network. ACO's machine
+code for this network runs faster than the AMD driver's (see Performance). It takes effect when the
+game restarts.
+**ACO Mode has been tested on one driver version only (AMD Software 26.9.2, RX 9070 XT). With other
+drivers it may fail: game crashes, wrong pictures or driver resets. If that happens, turn it off.**
+When ACO Mode cannot be used at all, NR runs as with it off and `dlssnr-amd.log` says why.
+
 Known issues:
 
-- It is slower than the Linux version (see Performance).
+- With ACO Mode off it is slower than the Linux version (see Performance).
 - The first time NR runs in a game, the network compiles for about a minute before it takes effect
   (on Linux about 10-20 seconds); this happens once for each game. Until then the picture looks as
   without NR, which does not mean the mod is not working: give it a minute.
-- Every game has to run on DXVK / vkd3d-proton, which changes the game's own performance and
-  behaviour.
-- The OptiScaler route is for DirectX 12 games only. Games whose FSR runs in their own shaders need
-  their DLSS option instead, which OptiScaler offers.
-- Overlays (Steam and others) can conflict, and the network pauses itself when video or system memory
-  runs short.
-- The picture is not the same as the Linux version's. The Windows network is built for the AMD
-  Windows driver's shader compiler and rounds differently in places; on a 1080p test frame the two
-  outputs are 48.6 dB PSNR apart.
+- DirectX 9 games run entirely on DXVK, which changes their performance and behaviour; overlays such
+  as Steam's may not show.
+- In DirectX 10 games the game's depth buffer is not passed to NR yet (not implemented).
+- Games whose FSR runs in their own shaders never hand it to OptiScaler: pick the game's DLSS option
+  instead, which OptiScaler offers.
+- The network pauses itself when video or system memory runs short.
+- With ACO Mode off the network is built by the AMD Windows driver's shader compiler, which rounds
+  differently from the Linux version in places; on a 1080p test frame the two outputs are 48.5 dB
+  PSNR apart.
 
 ## Build
 
@@ -289,7 +308,7 @@ Do not share packages that contain the model.
 ### Windows package
 
 ```sh
-bash fetch_deps.sh --windows                # adds GE-Proton 11-7 (DXVK, vkd3d-proton)
+bash fetch_deps.sh --windows                # adds GE-Proton 11-7 (DXVK)
 bash windows/build/build_package.sh
 ```
 

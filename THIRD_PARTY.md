@@ -12,12 +12,12 @@ its licence file.
 | [ReShade](https://github.com/crosire/reshade) 6.8.0 | BSD-3-Clause | Add-on headers; `ReShade32/64.dll` shipped in the ReShade routes. |
 | [reshade-shaders](https://github.com/crosire/reshade-shaders) | BSD-3-Clause | `ReShade.fxh`, `ReShadeUI.fxh` shipped. |
 | [vort_Shaders](https://github.com/vortigern11/vort_Shaders) | MIT | Motion vectors for the ReShade routes, shipped. |
-| [OptiScaler-NR](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass) 0.8.91 (Linux package), 0.8.4 (Windows package) | GPL-3.0 | The OptiScaler route's host, shipped as released; this project's DLLs are separate modules it loads. |
-| [AMD FidelityFX Super Resolution 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR) (`ffx_a.h`, `ffx_fsr1.h`) | MIT | Stored in `linux/shaders/passes/include/fsr1/` with its licence; compiled into `runtime_upscale.spv` (the Classic enlargement's FSR 1 choice), which ships with the licence beside it. |
+| [OptiScaler-NR](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass) 0.8.91 | GPL-3.0 | The OptiScaler route's host, shipped as released; this project's DLLs are separate modules it loads. |
+| [AMD FidelityFX Super Resolution 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR) (`ffx_a.h`, `ffx_fsr1.h`) | MIT | Stored in `linux/shaders/passes/include/fsr1/` and `windows/shaders/passes/include/fsr1/` with its licence; compiled into `runtime_upscale.spv` (the Classic enlargement's FSR 1 choice), which ships with the licence beside it. |
 | [Vulkan-Loader](https://github.com/KhronosGroup/Vulkan-Loader) 1.4.357 | Apache-2.0 | Built with the patches in `*/vulkan-loader/` and shipped; the changes are stated in `PATCHES.diff`. |
 | [Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) 1.4.357 | Apache-2.0 / MIT | Build only. |
 | [glslang](https://github.com/KhronosGroup/glslang) 16.5.0 | BSD-3-Clause and others | Build only (GLSL -> SPIR-V). |
-| [DXVK](https://github.com/doitsujin/dxvk), [vkd3d-proton](https://github.com/HansKristian-Work/vkd3d-proton) from [GE-Proton](https://github.com/GloriousEggroll/proton-ge-custom) 11-7 | zlib / LGPL-2.1 | Windows package only, shipped unmodified. |
+| [DXVK](https://github.com/doitsujin/dxvk) from [GE-Proton](https://github.com/GloriousEggroll/proton-ge-custom) 11-7 | zlib | Windows package only (the DX9 route), shipped unmodified. |
 
 NVIDIA's `nvngx_dlssnr.dll` and the weights in it are NVIDIA's property. This project contains no part
 of them; `linux/package/model-tools/` reads them from a copy the user supplies. The layer table in

@@ -1690,6 +1690,28 @@ layout(set = 0, binding = 4, std430) readonly buffer WExpandPairU { uvec2 wexpan
 #if defined(NR_POOL_F16) && NR_POOL_VECTOR_STORE
 layout(set = 0, binding = 5, std430) NR_COH buffer ActE4M3x4 { fe4m3vec4 act_e4m3x4[]; };
 #endif
+#if NR_TCHAIN
+// Tile counters between dispatches (nr_chain.glsl): the decoder's fused
+// upsample waits for the lower level's tiles it gathers; a persistent run's
+// last layer counts the tiles it wrote.
+#define NR_TC_WBIND 4
+#include "nr_chain.glsl"
+#endif
+// NR_TCHAIN with NR_DS_PROJECT: the downsample store's pooled 4x4 block at
+// ((2wx+shift)*2, (2wy+shift_y)*2), clipped the way the store clips it (grid,
+// raster, output tiles, writer rows; the identity shear only - the host chains
+// nothing else), as a range of next-level tiles. Lane q < 4 names corner tile
+// (tx0 + q&1, ty0 + q>>1) when it is in the range; the host counts the same.
+#define NR_TC_DS_TILE(nr_q, nr_out) { \
+    const int nr_px0 = (2 * int(nr_wx) + pc.shift) * 2, nr_py0 = (2 * int(nr_wy) + pc.shift_y) * 2; \
+    const uint nr_wr = pc.ds_writer_rows == 0u ? pc.ds_rows : pc.ds_writer_rows; \
+    const int nr_lx = min(min(int(pc.pool_tiles_x * 4u), int(pc.ds_raster)), int(pc.ds_otx * 4u)) - 1; \
+    const int nr_ly = min(int(pc.pool_tiles_y * 4u), int(nr_wr)) - 1; \
+    const int nr_x0 = max(nr_px0, 0), nr_x1 = min(nr_px0 + 3, nr_lx); \
+    const int nr_y0 = max(nr_py0, 0), nr_y1 = min(nr_py0 + 3, nr_ly); \
+    const int nr_tx = nr_x0 / 4 + int((nr_q) & 1u), nr_ty = nr_y0 / 4 + int((nr_q) >> 1u); \
+    nr_out = (nr_x0 <= nr_x1 && nr_y0 <= nr_y1 && nr_tx <= nr_x1 / 4 && nr_ty <= nr_y1 / 4) \
+        ? uint(nr_ty) * pc.ds_otx + uint(nr_tx) : 0xFFFFFFFFu; }
 
 // NR_BLEND_G32: the packed blends read each f16 gain pair as one u32
 // (blend_g_off is 16-byte aligned by put_f16, channel pairs are even).
@@ -1989,6 +2011,9 @@ layout(push_constant) uniform PushPersist {
 #if NR_PERSIST_DS || NR_PERSIST_UPS
     uint ds_off;        // u32 index of the DS (last) or UPS (first) layer's 11 fields, 0 = none
 #endif
+#if NR_TCHAIN
+    uint tc_rec;        // nr_chain.glsl record (weight arena u32 index), ~0 = none
+#endif
 } pcp;
 #ifndef NR_PERSIST_DF
 #define NR_PERSIST_DF 0
@@ -2009,6 +2034,10 @@ layout(push_constant) uniform Push {
     int shift, shift_y;        // signed offsets, in 4-pixel tiles
 #if defined(NR_POOL_F16) || defined(NR_FUSED_POST_BLEND) || defined(NR_FUSED_UPS_BLEND)
     uint pool_off, pool_tiles_x, pool_tiles_y;
+#elif NR_TCHAIN
+    // The host always pushes PushFSwin's twenty words; the record word that
+    // follows them has to be at word 20 here too.
+    uint nr_tc_pad_pool_off, nr_tc_pad_pool_tiles_x, nr_tc_pad_pool_tiles_y;
 #endif
 #endif
 #ifdef NR_DS_PROJECT
@@ -2035,6 +2064,9 @@ layout(push_constant) uniform Push {
 #if NR_NOISE_FIELD
     uint image_noise_off;   // u32 index of the precomputed noise features, 0: none
 #endif
+#endif
+#if NR_TCHAIN
+    NR_TCHAIN_FIELDS
 #endif
 } pc;
 #endif
@@ -2685,6 +2717,25 @@ void main() {
 #endif
 
     NR_PROF_BEGIN()
+#if NR_TCHAIN && !NR_PERSIST
+    NR_TC_PROLOGUE
+    // The frame tick: the frame's first C=32 layer (record word 1 set) counts
+    // frames for every tile counter behind it - a real barrier follows it, so
+    // everything chained later reads this frame's number.
+    if (nr_tc_rec != 0xFFFFFFFFu && nr_tc_w[nr_tc_rec + 1u] != 0u && gl_WorkGroupID.x == 0u &&
+        gl_WorkGroupID.y == 0u && gl_LocalInvocationIndex == 0u)
+        atomicAdd(nr_tc_u[nr_tc_w[nr_tc_rec + 4u]], 1u);
+#if defined(NR_FUSED_UPS_PROJECT)
+    // The 4x4 lower-level gather of fswin_body.glsl, clamped the same way.
+    NR_TC_WAIT_BEGIN
+    for (uint nr_q = 0u; nr_q < 4u; ++nr_q) {
+        const int bx = clamp(4 * int(nr_wx) + 2 * pc.shift + 3 * int(nr_q & 1u), 0, int(pc.blend_itiles_x * 4u) - 1);
+        const int by = clamp(4 * int(nr_wy) + 2 * pc.shift_y + 3 * int(nr_q >> 1u), 0, int(pc.blend_itiles_y * 4u) - 1);
+        NR_TC_WAIT_TILE(uint(by / 4) * pc.blend_itiles_x + uint(bx / 4))
+    }
+    NR_TC_WAIT_END
+#endif
+#endif
 #ifdef NR_FUSED_IMAGE_INPUT
     nr_prepare_features();
 #endif
@@ -2701,6 +2752,16 @@ void main() {
     // this segment left the epoch behind and the arena was zero-filled once at
     // build, so frame f waits for f+1 and never for a stale one.
     const uint nr_epoch = nr_sync[pcp.sync_off + 2u] + 1u;
+#if NR_TCHAIN
+    // Tile counters with the dispatches around the run (nr_chain.glsl): layer-0
+    // items wait for the tiles they read from the previous dispatch, the last
+    // layer's items count the tiles they wrote. The run's own epoch is the frame.
+    uint nr_tc_wait = 0xFFFFFFFFu, nr_tc_tab = 0xFFFFFFFFu, nr_tc_sig = 0xFFFFFFFFu, nr_tc_err = 0u;
+    if (pcp.tc_rec != 0xFFFFFFFFu && nr_tc_w[pcp.tc_rec + 6u] == NR_TC_MAGIC) {
+        nr_tc_wait = nr_tc_w[pcp.tc_rec];      nr_tc_tab = nr_tc_w[pcp.tc_rec + 2u];
+        nr_tc_sig  = nr_tc_w[pcp.tc_rec + 3u]; nr_tc_err = nr_tc_w[pcp.tc_rec + 5u];
+    }
+#endif
     const uint nr_slot = pcp.sync_off + 4u + pcp.total_windows + gl_WorkGroupID.x;
     // Items are numbered layer-major and claimed in increasing order, so a
     // workgroup's own layer only ever moves forward: the scan is a walk, not a
@@ -3047,6 +3108,38 @@ void main() {
             pc.ups_weight_off = wgt_u32[pcp.ds_off + 10u];
         }
 #endif
+#if NR_TCHAIN
+        if (nr_layer == 0u && nr_tc_tab != 0xFFFFFFFFu) {
+            if (tid < 32u) {
+                uint nr_tb = NR_TCHAIN_BOUND;
+                for (uint nr_q = 0u; nr_q < 4u; ++nr_q) {
+                    uint nr_t = 0xFFFFFFFFu;
+#if NR_PERSIST_UPS
+                    if (nr_ups_layer) {   // the fused upsample's 4x4 gather, as fswin_body.glsl clamps it
+                        const int bx = clamp(4 * int(nr_wx) + 2 * pc.shift + 3 * int(nr_q & 1u), 0, int(pc.blend_itiles_x * 4u) - 1);
+                        const int by = clamp(4 * int(nr_wy) + 2 * pc.shift_y + 3 * int(nr_q >> 1u), 0, int(pc.blend_itiles_y * 4u) - 1);
+                        nr_t = uint(by / 4) * pc.blend_itiles_x + uint(bx / 4);
+                    } else
+#endif
+                    {
+                        const int tx = 2 * int(nr_wx) + pc.shift + int(nr_q & 1u), ty = 2 * int(nr_wy) + pc.shift_y + int(nr_q >> 1u);
+                        if (tx >= 0 && ty >= 0 && tx < int(pc.tiles_x) && ty < int(pc.tiles_y))
+                            nr_t = uint(ty) * pc.tiles_x + uint(tx);
+                    }
+                    if (nr_t != 0xFFFFFFFFu) {
+                        const uint nr_e = nr_tc_w[nr_tc_tab + nr_t];
+                        if (nr_e != 0xFFFFFFFFu) {
+                            const uint nr_tt = (nr_e >> 20u) * nr_epoch;
+                            while (nr_tb != 0u && subgroupBroadcastFirst(atomicAdd(nr_tc_u[nr_tc_wait + (nr_e & 0xFFFFFu)], 0u)) < nr_tt)
+                                --nr_tb;
+                        }
+                    }
+                }
+                if (nr_tb == 0u && subgroupElect()) atomicMax(nr_tc_u[nr_tc_err], 1u);
+            }
+            barrier();
+        }
+#endif
 #if NR_OOB_SKIP
         for (uint q = 0u; q < uint(NR_WIN / 16); ++q) nr_mlive[q] = !nr_tile_oob(q);
 #endif
@@ -3133,27 +3226,95 @@ void main() {
     const uint nr_body = nr_live == 15u ? 15u
         : ((nr_live & 3u) == 0u ? 12u : (nr_live & 12u) == 0u ? 3u
         : (nr_live & 5u) == 0u ? 10u : (nr_live & 10u) == 0u ? 5u : 15u);
+    // No else-if chain: the AMD Windows driver 32.0.32015's compiler crashes in
+    // vkCreateComputePipelines when two instantiations of the body are the two arms
+    // of one if/else (an else-if chain, a switch, or `== m` / `!= m`, which it merges).
+    // The masks exclude each other, so separate ifs are the same program. How they
+    // are grouped moves the driver's register peak (NR_EDGE_FORM, per pipeline):
+    //   0  five separate ifs
+    //   1  the full body, then the four partial bodies inside one `if (nr_body != 15u)`
+    //   2  as 1, the partial bodies in reverse order
+#ifndef NR_EDGE_FORM
+#define NR_EDGE_FORM 1
+#endif
+#if NR_EDGE_FORM == 0
     [[dont_flatten]] if (nr_body == 15u) {
 #define NR_LIVE 15
 #include "fswin_body.glsl"
 #undef NR_LIVE
-    } else [[dont_flatten]] if (nr_body == 12u) {
+    }
+    [[dont_flatten]] if (nr_body == 12u) {
 #define NR_LIVE 12
 #include "fswin_body.glsl"
 #undef NR_LIVE
-    } else [[dont_flatten]] if (nr_body == 3u) {
+    }
+    [[dont_flatten]] if (nr_body == 3u) {
 #define NR_LIVE 3
 #include "fswin_body.glsl"
 #undef NR_LIVE
-    } else [[dont_flatten]] if (nr_body == 10u) {
+    }
+    [[dont_flatten]] if (nr_body == 10u) {
 #define NR_LIVE 10
 #include "fswin_body.glsl"
 #undef NR_LIVE
-    } else {
+    }
+    [[dont_flatten]] if (nr_body == 5u) {
 #define NR_LIVE 5
 #include "fswin_body.glsl"
 #undef NR_LIVE
     }
+#else
+    [[dont_flatten]] if (nr_body == 15u) {
+#define NR_LIVE 15
+#include "fswin_body.glsl"
+#undef NR_LIVE
+    }
+    [[dont_flatten]] if (nr_body != 15u) {
+#if NR_EDGE_FORM == 1
+    [[dont_flatten]] if (nr_body == 12u) {
+#define NR_LIVE 12
+#include "fswin_body.glsl"
+#undef NR_LIVE
+    }
+    [[dont_flatten]] if (nr_body == 3u) {
+#define NR_LIVE 3
+#include "fswin_body.glsl"
+#undef NR_LIVE
+    }
+    [[dont_flatten]] if (nr_body == 10u) {
+#define NR_LIVE 10
+#include "fswin_body.glsl"
+#undef NR_LIVE
+    }
+    [[dont_flatten]] if (nr_body == 5u) {
+#define NR_LIVE 5
+#include "fswin_body.glsl"
+#undef NR_LIVE
+    }
+#else
+    [[dont_flatten]] if (nr_body == 5u) {
+#define NR_LIVE 5
+#include "fswin_body.glsl"
+#undef NR_LIVE
+    }
+    [[dont_flatten]] if (nr_body == 10u) {
+#define NR_LIVE 10
+#include "fswin_body.glsl"
+#undef NR_LIVE
+    }
+    [[dont_flatten]] if (nr_body == 3u) {
+#define NR_LIVE 3
+#include "fswin_body.glsl"
+#undef NR_LIVE
+    }
+    [[dont_flatten]] if (nr_body == 12u) {
+#define NR_LIVE 12
+#include "fswin_body.glsl"
+#undef NR_LIVE
+    }
+#endif
+    }
+#endif
     }
 #else
 #define NR_LIVE 15
@@ -3163,6 +3324,22 @@ void main() {
 #if NR_PERSIST
         memoryBarrierBuffer();      // release: this window's tiles reach L2
         barrier();
+#if NR_TCHAIN
+        // The last layer counts the tiles this window wrote for the next dispatch.
+        if (nr_tc_sig != 0xFFFFFFFFu && nr_layer + 1u == pcp.n_layers && tid < 4u) {
+#if NR_PERSIST_DS
+            if (nr_ds_layer) {
+                uint nr_t; NR_TC_DS_TILE(tid, nr_t)
+                if (nr_t != 0xFFFFFFFFu) atomicAdd(nr_tc_u[nr_tc_sig + nr_t], 1u);
+            } else
+#endif
+            {
+                const int tx = 2 * int(nr_wx) + pc.shift + int(tid & 1u), ty = 2 * int(nr_wy) + pc.shift_y + int(tid >> 1u);
+                if (tx >= 0 && ty >= 0 && tx < int(pc.tiles_x) && ty < int(pc.tiles_y))
+                    atomicAdd(nr_tc_u[nr_tc_sig + uint(ty) * pc.tiles_x + uint(tx)], 1u);
+            }
+        }
+#endif
 #if NR_PERSIST_DF
         // The flag slots are the consumers' producer counters here: each run
         // adds `need` per frame, so a consumer is ready at need * epoch.
@@ -3440,6 +3617,19 @@ void main() {
         barrier();
         if (nr_any && gl_LocalInvocationIndex == 0u)
             act_e4m3[pc.o_off + nr_tile_base(0u)] = NR_E4M3(uintBitsToFloat(0x7fc00000u));
+    }
+#endif
+#if NR_TCHAIN && !NR_PERSIST && defined(NR_DS_PROJECT)
+    // The next level's persistent run waits for the tiles this window's
+    // downsample wrote.
+    if (nr_tc_sig != 0xFFFFFFFFu) {
+        memoryBarrier(gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease);
+        barrier();
+        if (gl_LocalInvocationIndex < 4u) {
+            uint nr_t; NR_TC_DS_TILE(gl_LocalInvocationIndex, nr_t)
+            if (nr_t != 0xFFFFFFFFu)
+                atomicAdd(nr_tc_u[nr_tc_sig + nr_t], 1u, gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease);
+        }
     }
 #endif
 #ifdef NR_PROF_OFF

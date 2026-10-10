@@ -3,8 +3,8 @@
 # packages were built and tested with, into toolchain/ and artifacts/ref/ (neither is in git).
 #
 #   bash fetch_deps.sh             what the Linux package needs
-#   bash fetch_deps.sh --windows   plus what the Windows package needs (GE-Proton 11-7 for DXVK
-#                                  and vkd3d-proton, and their licences)
+#   bash fetch_deps.sh --windows   plus what the Windows package needs (GE-Proton 11-7 for DXVK,
+#                                  and its licence)
 #
 # Already present entries are kept. Needs git, curl, tar and python3.
 #
@@ -84,8 +84,8 @@ da430e0a9c6eecefa0d1b27d05e16c426fb5d04e808b194d914eaac4b31bc0f8  $rs/ReShade32.
 EOF
 get "$rs/ReShade-LICENSE.md" https://raw.githubusercontent.com/crosire/reshade/v6.8.0/LICENSE.md \
     237ded5b8344f820113efab1e65e91e1f159d9202c5b4856606a0590d3ffdab0
-# OptiScaler-NR (GPL-3.0), the OptiScaler route's host, shipped as released: 0.8.91 in the Linux package, 0.8.4 in
-# the Windows package.
+# OptiScaler-NR (GPL-3.0), the OptiScaler route's host, shipped as released: 0.8.91. 0.8.4 still works with the same
+# core (NR_OPTI_ZIP=, see linux/package/optiscaler/README.md).
 get artifacts/ref/downloads/OptiScaler-NR-v0.8.4.zip \
     https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases/download/v0.8.4/OptiScaler-NR-v0.8.4.zip \
     8789912859882e66b3f3a1aa768db947da779dfd65225df69ea919052e73a2e4
@@ -95,7 +95,7 @@ get artifacts/ref/downloads/OptiScaler-NR-v0.8.91.zip \
 
 # ---- Windows package only ---------------------------------------------------------------------
 if [[ $windows == 1 ]]; then
-    # DXVK and vkd3d-proton as GE-Proton 11-7 ships them (PE builds, they run on Windows).
+    # DXVK as GE-Proton 11-7 ships it (PE build, it runs on Windows): the DX9 route's d3d9.dll and dxgi.dll.
     ge=GE-Proton11-7-x86_64
     if [[ ! -f "artifacts/ref/downloads/$ge.tar.gz" ]]; then
         echo "fetch $ge.tar.gz"
@@ -106,12 +106,9 @@ if [[ $windows == 1 ]]; then
     echo "7db87e9787e20c35cbdac26018431d5794626b626e4067b050684e45a88cc2ca229d7d263519eafb2e168cde5bef57611065d159d3685aaec152ccb9abe3073f  artifacts/ref/downloads/$ge.tar.gz" |
         sha512sum -c --quiet - || { echo "checksum mismatch: $ge.tar.gz" >&2; exit 1; }
     [[ -d "toolchain/$ge" ]] || tar -C toolchain -xzf "artifacts/ref/downloads/$ge.tar.gz"
-    mkdir -p artifacts/ref/dxvk toolchain/vkd3d-proton-src
+    mkdir -p artifacts/ref/dxvk
     get artifacts/ref/dxvk/LICENSE \
         https://raw.githubusercontent.com/doitsujin/dxvk/601930949d111edbbcf9dd463948426d9f8f6ddd/LICENSE \
         a5cb1a6ded7d2d7e92d550ba28edd21be2d1d4044662b399887351023e30ce64
-    get toolchain/vkd3d-proton-src/LICENSE \
-        https://raw.githubusercontent.com/HansKristian-Work/vkd3d-proton/af89350cc2eacd9da2293fbae96bd9ab4987c9bb/LICENSE \
-        dc626520dcd53a22f727af3ee42c770e56c97a64fe3adb063799d8ab032fe551
 fi
 echo "dependencies ready"

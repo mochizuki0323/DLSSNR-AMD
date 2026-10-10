@@ -109,12 +109,20 @@ f16vec2 nr_swin_exp2(vec2 x) {
 // field, and that is one `v_lshl_add_u32`: (0x3C00+m)<<5 = 0x78000 + 32m per
 // half, and the high half's field leaves 0x80000000 after the 32-bit wrap.
 // Bit-identical for every clamped value; one instruction instead of two.
+#ifndef NR_EXP_NOHI
+#define NR_EXP_NOHI 0
+#endif
 f16vec2 nr_swin_exp_baked(vec2 x, vec2 bias) {
 #if defined(NR_ABLATE_EXP) && NR_ABLATE_EXP
     return f16vec2(x + bias);   // diagnostic (wrong output): the exponential priced by leaving it out
 #endif
 #if NR_EXP_I16
     const uint h=nr_clamp_h2_bits(f16vec2(fma(x,vec2(0.044921875),bias)), 0x3C20, 0x3E47);
+#elif NR_EXP_NOHI
+    // The host's weight audit (nr_graph.cpp, g_nohi) proved that no logit of this
+    // layer reaches the upper bound, so max alone is the same function here.
+    const f16vec2 y=max(f16vec2(fma(x,vec2(0.044921875),bias)),f16vec2(1.03125hf));
+    const uint h=packFloat2x16(y);
 #else
     const f16vec2 y=clamp(f16vec2(fma(x,vec2(0.044921875),bias)),
                          f16vec2(1.03125hf),f16vec2(1.5693359375hf));

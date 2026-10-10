@@ -3,6 +3,7 @@
 #include "nr_runtime_dispatch.hpp"
 #define NR_NO_MAIN 1
 #include "nr_graph.cpp"
+#include "nr_input_check.hpp"
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
@@ -73,6 +74,16 @@ void compute_barrier(VkCommandBuffer cmd, bool exec_only = false, bool inv_only 
 }
 
 // runtime_prep.comp's push block; see the shader.
+// runtime_transfer.comp's push block, byte for byte.
+struct TransferPush {
+    uint32_t w, h, model_w, model_h, passthrough;
+    float detail, colour, max_ratio, white;
+    uint32_t mode, flags;
+    float sigma;
+};
+static_assert(sizeof(TransferPush) == 48, "runtime_transfer.comp's push block");
+constexpr uint32_t kTransferEnlarged = 1, kTransferGuided = 2, kTransferRoundU8 = 4;
+
 struct PrepPush {
     uint32_t w, h, mode, flags, curve;
     float bias, contrast, saturation, k, cap;
@@ -257,6 +268,12 @@ struct Temporal {
     // colour (and depth) for the caller's own images; see Impl::DirectSrc.
     std::vector<VkBuffer> pre_buffers, post_buffers;
     nrvk::Context::Image hist_store[2]{};
+    // the post block's history, reconstructed by the pre block (RGBA32F storage,
+    // model extent) when the package has the *hp variants; else an empty image.
+    nrvk::Context::Image hpass{};
+    bool hp{};
+    // (research NR_HIST16=1): the one-pass history images in RGBA16F.
+    bool h16{};
     bool pingpong{};
     uint32_t hcur{};
     nrvk::Context::Image& hist(uint32_t i) { return i ? history_b : history; }
@@ -298,6 +315,7 @@ struct Temporal {
             if (post_pp[c].device) post_pp[c].destroy();
         }
         if (history_b.handle) ctx.destroy(history_b);
+        if (hpass.handle) ctx.destroy(hpass);
         // flow0_sampled aliases flow[0]; only its sampler is ours to free.
         if (motion_sampler) vkDestroySampler(ctx.device, motion_sampler, nullptr);
         ctx.destroy(history);
@@ -345,6 +363,82 @@ struct Runtime::Impl {
     bool post_alpha{};
     VkFilter downscale_filter{VK_FILTER_LINEAR};
     nrvk::Context::Image keep_full{}, full_out{};
+    // `keep_native`: keep_full in the frame's own format (an *_SRGB frame's UNORM twin) rather than
+    // RGBA32F. The frame is copied into it as it is and runtime_downscale.comp makes the model's
+    // input from it, sampling where the linear blit would (`taps`, measured from a probe blit at
+    // build). `store_native`: the transfer pass (runtime_transfer_store.spv) also writes the answer
+    // back into keep_full, each pixel after reading it, with the alpha pass's rounding; then there
+    // is no full_out and no alpha pass, and the write-back is a copy.
+    bool keep_native{}, store_native{};
+    nrvk::Kernel downscale;
+    nrvk::Buffer taps{};
+    // store_native with the caller's frame itself (usage SAMPLED and STORAGE, keep_full's format):
+    // runtime_downscale.comp reads it and the transfer pass writes the answer back into it, so
+    // neither the copy into keep_full nor the copy back is made. Views and sets per recording,
+    // in a ring retired like DirectSrc's. transfer_binds / transfer_prep_binds: the images the two
+    // transfer kernels were created with, [2] (keep) and [3] (answer) replaced by the frame's.
+    struct FrameRw { VkImageView view{}; VkDescriptorPool pool{}; VkDescriptorSet down{}, transfer{}, transfer_prep{}; };
+    std::vector<FrameRw> frame_ring;
+    bool frame_rw_failed{}, frame_rw_logged{};
+    std::vector<nrvk::Context::Image> transfer_binds, transfer_prep_binds;
+    const FrameRw* frame_rw_source(VkImage image, VkFormat format) {
+        if (frame_rw_failed) return nullptr;
+        const VkDevice dev = session.ctx.device;
+        if (frame_ring.empty()) frame_ring.resize(size_t(kRetireAfter) + 2);
+        FrameRw& f = frame_ring[size_t(recordings % frame_ring.size())];
+        if (f.view) { vkDestroyImageView(dev, f.view, nullptr); f.view = VK_NULL_HANDLE; }
+        f.down = f.transfer = f.transfer_prep = VK_NULL_HANDLE;
+        bool ok = true;
+        if (!f.pool) {
+            const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
+                                                  {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6},
+                                                  {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 10}};
+            VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            pi.maxSets = 3; pi.poolSizeCount = 3; pi.pPoolSizes = sizes;
+            ok = vkCreateDescriptorPool(dev, &pi, nullptr, &f.pool) == VK_SUCCESS;
+        } else {
+            ok = vkResetDescriptorPool(dev, f.pool, 0) == VK_SUCCESS;
+        }
+        if (ok) {
+            VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vi.image = image; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = format;
+            vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            ok = vkCreateImageView(dev, &vi, nullptr, &f.view) == VK_SUCCESS;
+        }
+        if (ok) {
+            nrvk::Context::Image sampled = keep_full;   // its sampler; texelFetch ignores filtering
+            sampled.handle = image; sampled.view = f.view; sampled.layout = VK_IMAGE_LAYOUT_GENERAL;
+            nrvk::Context::Image storage = sampled;
+            storage.sampler = VK_NULL_HANDLE;
+            nrvk::Context::Image tin = session.tex_in;
+            tin.sampler = VK_NULL_HANDLE; tin.layout = VK_IMAGE_LAYOUT_GENERAL;
+            f.down = kernel_set(dev, f.pool, downscale, {taps.handle}, {&sampled, &tin});
+            auto set_for = [&](const nrvk::Kernel& k, std::vector<nrvk::Context::Image> binds) {
+                binds[2] = sampled; binds[3] = storage;
+                std::vector<const nrvk::Context::Image*> p;
+                for (const auto& b : binds) p.push_back(&b);
+                return kernel_set(dev, f.pool, k, {}, p);
+            };
+            f.transfer = set_for(transfer_pass, transfer_binds);
+            if (transfer_prep.device) f.transfer_prep = set_for(transfer_prep, transfer_prep_binds);
+            ok = f.down && f.transfer && (!transfer_prep.device || f.transfer_prep);
+        }
+        if (!ok) {
+            if (f.view) { vkDestroyImageView(dev, f.view, nullptr); f.view = VK_NULL_HANDLE; }
+            frame_rw_failed = true;
+            nr::logf("[nr] reading and writing the frame in place failed; copying instead");
+            return nullptr;
+        }
+        if (!frame_rw_logged) {
+            frame_rw_logged = true;
+            nr::logf("[nr] Model resolution: frame read and written in place (VkFormat %u)", unsigned(format));
+        }
+        return &f;
+    }
+    // Classic with a scaler other than bilinear: the model's answer enlarged to the frame by
+    // runtime_upscale.comp.
+    nrvk::Context::Image up_result{}, up_shown{};
+    nrvk::Kernel upscale_pass, upscale_prep;
     // Multi-pass: what the first pass was shown, kept for the transfer pass
     // because later passes overwrite tex_in; and one history per pass.
     uint32_t max_passes{1};
@@ -372,17 +466,33 @@ struct Runtime::Impl {
     uint32_t timing_slot{};      // the slot the next recording writes
     uint64_t timings_recorded{};
     float gpu_ms{}, gpu_ms_avg{};
+    // Each pass's network is timed too: a pair around its dispatches, after the pair for the
+    // whole. network_ms is their sum, the rest of gpu_ms is the route's own work (input,
+    // enlargement and composition, copies).
+    bool split_timing{};
+    uint32_t timing_stride{2};             // queries per slot: 2 + 2 x max_passes
+    uint32_t slot_passes[kTimingSlots]{};  // passes timed in each slot
+    float net_ms{}, net_ms_avg{};
     // Read the oldest slot in the ring, if its recording has finished. Called
     // once per recording, from the thread that records.
     void read_timing() {
         if (!timing_ok || timings_recorded <= kTimingSlots) return;
         const uint32_t oldest = timing_slot;   // the next to be overwritten
-        uint64_t stamps[2] = {};
-        if (vkGetQueryPoolResults(session.ctx.device, timing, oldest * 2, 2, sizeof stamps, stamps,
+        const uint32_t n = 2 + 2 * slot_passes[oldest];
+        uint64_t stamps[2 + 2 * 16] = {};
+        if (n > sizeof stamps / sizeof stamps[0]) return;
+        if (vkGetQueryPoolResults(session.ctx.device, timing, oldest * timing_stride, n, n * sizeof(uint64_t), stamps,
                                   sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
             return;   // VK_NOT_READY: still running, ask again next frame
         if (stamps[1] <= stamps[0]) return;
         gpu_ms = float(double(stamps[1] - stamps[0]) * timestamp_ns / 1e6);
+        if (slot_passes[oldest]) {
+            uint64_t net = 0;
+            for (uint32_t p = 0; p < slot_passes[oldest]; ++p)
+                if (stamps[3 + 2 * p] > stamps[2 + 2 * p]) net += stamps[3 + 2 * p] - stamps[2 + 2 * p];
+            net_ms = float(double(net) * timestamp_ns / 1e6);
+            net_ms_avg = net_ms_avg > 0.0f ? net_ms_avg + (net_ms - net_ms_avg) * 0.1f : net_ms;
+        }
         // A plain exponential average. Ten frames is enough to stop the last
         // digit dancing and short enough that a resolution change shows up
         // immediately rather than being dragged in from before it.
@@ -447,6 +557,10 @@ struct Runtime::Impl {
     std::vector<std::vector<std::vector<uint8_t>>> pass_push;
     nrvk::Context::Image mask_image;
     nrvk::Buffer mask_rect;
+    // the plain path's pre and post (the graph's own pipelines), for sampling the
+    // caller's colour in place without the temporal path (Impl::DirectSrc, plain sets).
+    const nrvk::Kernel* plain_pre{};
+    const nrvk::Kernel* plain_post{};
     const nrvk::Kernel* original_pre{};
     nrvk::Context::Image encoded;
     // An 8-bit frame: the answer is rounded as frame_image.py does before the
@@ -481,9 +595,12 @@ struct Runtime::Impl {
     // blended foreground and background vectors at every silhouette and left the
     // five-tap depth choice a quarter of a texel to work with.
     struct DirectSrc {
-        VkImageView cview{}, dview{}, mview{};
+        VkImageView cview{}, dview{}, mview{}, tview{};
         VkDescriptorPool pool{};
         VkDescriptorSet pre[2]{}, post[2]{};
+        // the post block stores into the caller's image through cview
+        // (a storage descriptor) and the write-back copy goes.
+        bool store{};
     };
     std::vector<DirectSrc> direct_ring;
     bool direct_src_failed{}, direct_src_logged{};
@@ -557,13 +674,16 @@ struct Runtime::Impl {
         if (d.cview) vkDestroyImageView(dev, d.cview, nullptr);
         if (d.dview) vkDestroyImageView(dev, d.dview, nullptr);
         if (d.mview) vkDestroyImageView(dev, d.mview, nullptr);
-        d.cview = d.dview = d.mview = VK_NULL_HANDLE;
+        if (d.tview) vkDestroyImageView(dev, d.tview, nullptr);
+        d.cview = d.dview = d.mview = d.tview = VK_NULL_HANDLE;
         d.pre[0] = d.pre[1] = d.post[0] = d.post[1] = VK_NULL_HANDLE;
+        d.store = false;
     }
     // Any of colour (with its depth) and motion may be null: that one is our
     // own image, bound as in the sets made at creation.
     const DirectSrc* direct_source(VkImage colour, VkFormat format, VkImage depth, VkImage motion,
-                                   VkFormat mformat, uint32_t c) {
+                                   VkFormat mformat, uint32_t c, bool store = false, VkImage target = VK_NULL_HANDLE,
+                                   bool plain = false) {
         if (!colour && !motion) return nullptr;
         auto& s = session; auto& t = temporal;
         const VkDevice dev = s.ctx.device;
@@ -579,8 +699,8 @@ struct Runtime::Impl {
         bool ok = true;
         if (!d.pool) {
             const VkDescriptorPoolSize sizes[] = {
-                {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, uint32_t(t.pre_buffers.size() + t.post_buffers.size())},
-                {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 7}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2}};
+                {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16},
+                {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 7}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4}};
             VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
             pi.maxSets = 2; pi.poolSizeCount = 3; pi.pPoolSizes = sizes;
             ok = vkCreateDescriptorPool(dev, &pi, nullptr, &d.pool) == VK_SUCCESS;
@@ -590,7 +710,7 @@ struct Runtime::Impl {
         const bool colour_ok = ok && (!colour || (view(colour, format, &d.cview) &&
                                                   (!depth || view(depth, VK_FORMAT_R32_SFLOAT, &d.dview))));
         const bool motion_ok = ok && (!motion || view(motion, mformat, &d.mview));
-        ok = colour_ok && motion_ok;
+        ok = colour_ok && motion_ok && (!(colour && store && target) || view(target, format, &d.tview));
         if (ok) {
             // The caller's images, with our own samplers, in GENERAL; this
             // frame's history parity only.
@@ -599,10 +719,30 @@ struct Runtime::Impl {
             if (depth) { dim.handle = depth; dim.view = d.dview; dim.layout = VK_IMAGE_LAYOUT_GENERAL; }
             if (motion) { mim.handle = motion; mim.view = d.mview; mim.layout = VK_IMAGE_LAYOUT_GENERAL; }
             nrvk::Context::Image surf0 = s.surf0;
-            d.pre[c] = kernel_set(dev, d.pool, t.pre_pp[c], t.pre_buffers, {&cim, &mim, &t.hist(c), &dim});
-            d.post[c] = kernel_set(dev, d.pool, t.post_pp[c], t.post_buffers,
-                                   {&surf0, &t.hist_store[c ^ 1u], &cim, &mim, &t.hist(c)});
+            // the answer straight into the caller's image (same format as our own
+            // answer image, storage usage): the post samples its own pixel's centre with
+            // a NEAREST sampler before it stores that pixel, so nothing reads a stored texel.
+            if (colour && store) {
+                surf0.handle = target ? target : colour; surf0.view = target ? d.tview : d.cview;
+                surf0.layout = VK_IMAGE_LAYOUT_GENERAL; surf0.sampler = VK_NULL_HANDLE; d.store = true;
+            }
+            if (plain) {
+                // The graph's own pre and post: the buffers and images they were created with
+                // (nr_graph.cpp), the caller's colour for tex_in.
+                const VkBuffer a = s.act.handle, w = s.wgt.handle;
+                nrvk::Context::Image surf1 = s.surf1;
+                d.pre[0] = kernel_set(dev, d.pool, *plain_pre, {a, a, w, w, w, a}, {&cim});
+                d.post[0] = kernel_set(dev, d.pool, *plain_post, {a, a, w, w, w}, {&surf0, &surf1, &cim});
+                ok = d.pre[0] && d.post[0];
+            } else {
+            d.pre[c] = t.hp ? kernel_set(dev, d.pool, t.pre_pp[c], t.pre_buffers, {&cim, &mim, &t.hist(c), &dim, &t.hpass})
+                            : kernel_set(dev, d.pool, t.pre_pp[c], t.pre_buffers, {&cim, &mim, &t.hist(c), &dim});
+            d.post[c] = t.hp ? kernel_set(dev, d.pool, t.post_pp[c], t.post_buffers,
+                                          {&surf0, &t.hist_store[c ^ 1u], &cim, &mim, &t.hist(c), &t.hpass})
+                             : kernel_set(dev, d.pool, t.post_pp[c], t.post_buffers,
+                                          {&surf0, &t.hist_store[c ^ 1u], &cim, &mim, &t.hist(c)});
             ok = d.pre[c] && d.post[c];
+            }
         }
         if (!ok) {
             direct_slot_release(d);
@@ -628,6 +768,193 @@ struct Runtime::Impl {
     VkFormat colour_format{};
     uint32_t width{}, height{};
 
+    // ---- the in-game check (diagnostic) --------------------------------------
+    //
+    // For the in-game green screen (2026-09): a feature that stays wrong until
+    // the next one, and nothing in the log. Every kEvery recordings the
+    // recording also copies, after the network, the tile-counter region (frame
+    // word, the waits' error words, the counters), each persistent run's epoch
+    // and error word, and an 8x8 grid of the history the next frame reads, into
+    // a host-visible buffer. kLag recordings later - that submission has long
+    // run - the render thread reads it and logs whatever is off: a wait that
+    // ran out of its bound (it then reads whatever is there), a counter that is
+    // not need x frames, a run whose epoch is not the frame count, a history
+    // holding NaN/Inf. Never a wait. Off unless NR_GAME_CHECK=1.
+    struct Check {
+        static constexpr uint64_t kEvery = 32, kLag = 16, kBeat = 1920;
+        static constexpr uint32_t kGrid = 8;
+        bool off{};
+        nrvk::Buffer buf{};
+        VkDeviceSize persist_at{}, hist_at{};
+        uint64_t written_at{~0ull};   // the recording that copied, until read
+        uint64_t feature{};           // the feature bound at that recording
+        bool hist{};                  // that copy took the history
+        size_t tc_errors{}, persist_errors{};
+        size_t off_count{~size_t(0)};
+        uint64_t beat_at{};
+        std::set<uint64_t> hist_bad;
+        std::map<uint64_t, int> feature_checks;
+    };
+    Check check;
+    // NR_INPUT_CHECK (nr_input_check.hpp): what the engine path is handed and hands back.
+    incheck::State incheck;
+    void check_record(VkCommandBuffer cmd) {
+        auto& k = check;
+        auto& s = session;
+        if (k.off) return;
+        if (!k.buf.handle) {
+            const char* e = std::getenv("NR_GAME_CHECK");
+            if (!e || std::atoi(e) != 1) { k.off = true; return; }
+            VkDeviceSize n = VkDeviceSize(s.tc_words) * 4;
+            k.persist_at = n;
+            n += VkDeviceSize(s.persist_err.size()) * 8;
+            k.hist_at = n = (n + 15) & ~VkDeviceSize(15);
+            n += VkDeviceSize(Check::kGrid) * Check::kGrid * 16;
+            try {
+                k.buf = s.ctx.buffer(n, true);
+            } catch (const std::exception& x) {
+                nr::logf("[nr] check: no host-visible buffer (%s), off", x.what());
+                k.off = true;
+                return;
+            }
+            nr::logf("[nr] check on (%ux%u): %zu chained pairs, %zu counters, %zu persistent runs, history %s",
+                     width, height, s.tc_pair.size(), s.tc_expect.size(), s.persist_err.size(),
+                     temporal.enabled ? "8x8 texels" : "none");
+        }
+        if (recordings % Check::kEvery) return;
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+        std::vector<VkBufferCopy> r;
+        if (s.tc_words) r.push_back({VkDeviceSize(s.tc_base) * 4, 0, VkDeviceSize(s.tc_words) * 4});
+        for (size_t i = 0; i < s.persist_err.size(); ++i)   // epoch word, error word
+            r.push_back({VkDeviceSize(s.persist_err[i]) - 4, k.persist_at + VkDeviceSize(i) * 8, 8});
+        if (!r.empty()) vkCmdCopyBuffer(cmd, s.act.handle, k.buf.handle, uint32_t(r.size()), r.data());
+        k.hist = temporal.enabled;
+        if (k.hist) {
+            const auto& h = temporal.hist(temporal.hcur);   // what the next frame reads
+            std::vector<VkBufferImageCopy> ir;
+            for (uint32_t y = 0; y < Check::kGrid; ++y)
+                for (uint32_t x = 0; x < Check::kGrid; ++x) {
+                    VkBufferImageCopy c{};
+                    c.bufferOffset = k.hist_at + VkDeviceSize(y * Check::kGrid + x) * 16;
+                    c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                    c.imageOffset = {int32_t((2 * x + 1) * h.w / (2 * Check::kGrid)),
+                                     int32_t((2 * y + 1) * h.h / (2 * Check::kGrid)), 0};
+                    c.imageExtent = {1, 1, 1};
+                    ir.push_back(c);
+                }
+            vkCmdCopyImageToBuffer(cmd, h.handle, VK_IMAGE_LAYOUT_GENERAL, k.buf.handle,
+                                   uint32_t(ir.size()), ir.data());
+        }
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 1, &mb, 0, nullptr, 0, nullptr);
+        k.written_at = recordings;
+        k.feature = bound_feature;
+    }
+    void check_read() {
+        auto& k = check;
+        auto& s = session;
+        if (!k.buf.handle || k.written_at == ~0ull || recordings < k.written_at + Check::kLag) return;
+        const uint64_t at = k.written_at;
+        k.written_at = ~0ull;
+        const unsigned long long fid = (unsigned long long)k.feature;
+        const uint32_t* w = k.buf.as<uint32_t>();
+        const std::vector<uint32_t> v(w, w + s.tc_words);
+        const uint32_t* p = w + k.persist_at / 4;
+        const bool have_f = s.tc_words != 0;
+        const uint32_t f = have_f ? v[0] : (s.persist_err.empty() ? 0u : p[0]);
+        // Waits that ran out: sticky words, so the count only grows.
+        size_t te = 0;
+        std::string names;
+        for (size_t i = 0; i < s.tc_err.size(); ++i)
+            if (v[s.tc_err[i]]) {
+                ++te;
+                if (names.size() < 300 && i < s.tc_pair.size()) names += (names.empty() ? "" : ", ") + s.tc_pair[i];
+            }
+        if (te > k.tc_errors) {
+            nr::logf("[nr] check: %zu tile-counter waits ran out by frame %u (recording %llu, feature %llx): %s",
+                     te, f, (unsigned long long)at, fid, names.c_str());
+            k.tc_errors = te;
+        }
+        size_t pe = 0;
+        std::string layers;
+        for (size_t i = 0; i < s.persist_err.size(); ++i)
+            if (p[2 * i + 1]) {
+                ++pe;
+                layers += " run " + std::to_string(i) + " layer " + std::to_string(p[2 * i + 1] - 1u);
+            }
+        if (pe > k.persist_errors) {
+            nr::logf("[nr] check: %zu persistent-run waits ran out by frame %u (recording %llu, feature %llx):%s",
+                     pe, f, (unsigned long long)at, fid, layers.c_str());
+            k.persist_errors = pe;
+        }
+        // After whole frames every counter holds need x frames and every run's epoch is the frame count.
+        size_t bad = 0, epoch_bad = 0;
+        std::string ex;
+        if (have_f) {
+            for (const auto& e : s.tc_expect) {
+                const uint32_t want = e.need * f;
+                if (v[e.word] == want) continue;
+                if (bad < 4) {
+                    char b[160];
+                    std::snprintf(b, sizeof b, " [%s: counter %u = %u, want %u x %u]",
+                                  e.pair < s.tc_pair.size() ? s.tc_pair[e.pair].c_str() : "?", e.word, v[e.word], e.need, f);
+                    ex += b;
+                }
+                ++bad;
+            }
+            for (size_t i = 0; i < s.persist_err.size(); ++i)
+                if (p[2 * i] != f) {
+                    if (epoch_bad < 4) ex += " [run " + std::to_string(i) + " epoch " + std::to_string(p[2 * i]) + "]";
+                    ++epoch_bad;
+                }
+        }
+        if (have_f && bad + epoch_bad != k.off_count) {
+            if (bad + epoch_bad)
+                nr::logf("[nr] check: frame %u (recording %llu, feature %llx): %zu of %zu counters and %zu of %zu "
+                         "run epochs off:%s", f, (unsigned long long)at, fid, bad, s.tc_expect.size(), epoch_bad,
+                         s.persist_err.size(), ex.c_str());
+            else
+                nr::logf("[nr] check: frame %u: all %zu counters = need x frames, %zu run epochs = frames%s", f,
+                         s.tc_expect.size(), s.persist_err.size(), k.off_count == ~size_t(0) ? "" : " again");
+            k.off_count = bad + epoch_bad;
+        }
+        // The history the next frame reads.
+        if (!k.hist) return;
+        const float* h = reinterpret_cast<const float*>(w + k.hist_at / 4);
+        const uint32_t n = Check::kGrid * Check::kGrid;
+        uint32_t nonfinite = 0;
+        float peak = 0.0f;
+        double mean[3] = {};
+        for (uint32_t i = 0; i < n; ++i)
+            for (uint32_t c = 0; c < 4; ++c) {
+                const float x = h[i * 4 + c];
+                if (!std::isfinite(x)) { ++nonfinite; continue; }
+                peak = std::max(peak, std::fabs(x));
+                if (c < 3) mean[c] += x / n;
+            }
+        const bool weird = nonfinite || peak > 1024.0f;
+        int& seen = k.feature_checks[k.feature];
+        ++seen;
+        if (weird && k.hist_bad.insert(k.feature).second)
+            nr::logf("[nr] check: history of feature %llx at frame %u: %u NaN/Inf of %u values, max |v| %g, "
+                     "mean %.4f %.4f %.4f", fid, f, nonfinite, n * 4, double(peak), mean[0], mean[1], mean[2]);
+        else if (seen <= 2 || at >= k.beat_at + Check::kBeat) {
+            // A new feature's first two looks, then a heartbeat.
+            nr::logf("[nr] check: frame %u, feature %llx: history mean %.4f %.4f %.4f, max %.4g; waits ran out "
+                     "%zu+%zu, counters off %zu", f, fid, mean[0], mean[1], mean[2], double(peak), k.tc_errors,
+                     k.persist_errors, k.off_count == ~size_t(0) ? size_t(0) : k.off_count);
+            if (seen > 2) k.beat_at = at;
+        }
+        if (k.feature_checks.size() > 256) k.feature_checks.clear();
+    }
+
     ~Impl() {
         // Caller has already completed its submitted command buffers.
         auto& s = session;
@@ -651,6 +978,16 @@ struct Runtime::Impl {
         if (prep_state.handle) session.ctx.destroy(prep_state);
         if (keep.handle) session.ctx.destroy(keep);
         if (keep_full.handle) session.ctx.destroy(keep_full);
+        if (downscale.device) downscale.destroy();
+        if (taps.handle) session.ctx.destroy(taps);
+        for (auto& f : frame_ring) {
+            if (f.view) vkDestroyImageView(s.ctx.device, f.view, nullptr);
+            if (f.pool) vkDestroyDescriptorPool(s.ctx.device, f.pool, nullptr);
+        }
+        if (up_result.handle) session.ctx.destroy(up_result);
+        if (up_shown.handle) session.ctx.destroy(up_shown);
+        if (upscale_pass.device) upscale_pass.destroy();
+        if (upscale_prep.device) upscale_prep.destroy();
         if (full_out.handle) session.ctx.destroy(full_out);
         if (shown_keep.handle) session.ctx.destroy(shown_keep);
         if (lograt.handle) session.ctx.destroy(lograt);
@@ -666,6 +1003,8 @@ struct Runtime::Impl {
         if (mask_pre.device) mask_pre.destroy();
         if (mask_resolve.device) mask_resolve.destroy();
         if (timing) { vkDestroyQueryPool(s.ctx.device, timing, nullptr); timing = VK_NULL_HANDLE; }
+        if (check.buf.handle) s.ctx.destroy(check.buf);
+        incheck.destroy(s.ctx);
         temporal.destroy(s.ctx);
         if (s.ctx.pipeline_cache) {
             vkDestroyPipelineCache(s.ctx.device, s.ctx.pipeline_cache, nullptr);
@@ -705,14 +1044,14 @@ struct Runtime::Impl {
     // push, so a later pass costs four small blobs rather than a copy of the
     // whole table.
     static bool carries_controls(const std::string& kern) {
-        return kern == "fswinimagepreds32" || kern.rfind("imgin", 0) == 0 ||
+        return kern.rfind("fswinimagepreds32", 0) == 0 || kern.rfind("imgin", 0) == 0 ||
                kern == "fswinimagepost32" || kern.rfind("imgout", 0) == 0;
     }
 
     void patch_push(std::vector<uint8_t>& blob, const std::string& kern, const Resolved& r) const {
         const float skin = r.mask ? (r.skin_in < 0 ? r.structure : r.skin_in) : -1.0f;
         const float background = r.mask ? r.structure : -1.0f;
-        if (kern == "fswinimagepreds32") {
+        if (kern.rfind("fswinimagepreds32", 0) == 0) {
             PushPreImage p{};
             std::memcpy(&p, blob.data() + sizeof(PushFSwin), sizeof p);
             p.style = float(r.style) / 128; p.tone = r.tone;
@@ -789,7 +1128,21 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     // development tree has build/ and artifacts/ at its root instead.
     const auto data = std::filesystem::is_directory(root / "dlssnr-amd") ? root / "dlssnr-amd" : root;
     const bool installed = data != root;
-    const auto network_shaders = installed ? data / "shaders" : root / "build";
+    // The ACO network (nr_pipeline_binary.hpp) needs a device created with pipeline binaries; one that
+    // was not (a game's device made before we could add them) builds with the driver's compiler.
+    if (!nr::binary::directory().empty() && !nr::binary::enabled(host.device))
+        nr::binary::disable("the device was created without pipeline binaries");
+    const std::string aco = nr::binary::directory();
+    const auto native_shaders = installed ? data / "shaders" : root / "build";
+    const auto network_shaders = !aco.empty() ? std::filesystem::path(aco) / "shaders" : native_shaders;
+    // Shaders are read from inside the NR root, or from the ACO bundle when one is in use.
+    const auto inside = [&](const std::filesystem::path& p) {
+        for (const auto& base : {root, aco.empty() ? root : std::filesystem::canonical(aco)}) {
+            const auto rel = p.lexically_relative(base);
+            if (!rel.empty() && *rel.begin() != "..") return true;
+        }
+        return false;
+    };
     if (!std::isfinite(config.model_scale) || config.model_scale <= 0.f || config.model_scale > 1.f)
         throw std::invalid_argument("model_scale must be in (0, 1]");
     if (config.max_passes < 1 || config.max_passes > 16)
@@ -853,7 +1206,9 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     if (props[host.queue_family].timestampValidBits && s.ctx.timestamp_period > 0.0f) {
         VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
-        qi.queryCount = Impl::kTimingSlots * 2;
+        impl_->split_timing = true;
+        impl_->timing_stride = 2 + 2 * config.max_passes;
+        qi.queryCount = Impl::kTimingSlots * impl_->timing_stride;
         if (vkCreateQueryPool(s.ctx.device, &qi, nullptr, &impl_->timing) == VK_SUCCESS) {
             impl_->timing_ok = true;
             impl_->timestamp_ns = s.ctx.timestamp_period;
@@ -932,22 +1287,97 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         throw std::runtime_error("NR graph initialization failed");
     timer.mark("graph");
     impl_->width = config.width; impl_->height = config.height;
+    // The runtime passes are the driver's compile in either case (the ACO bundle's are the same SPIR-V).
     const auto adapters = std::filesystem::canonical(config.adapter_shaders.empty()
-        ? network_shaders / "runtime" : std::filesystem::path(config.adapter_shaders));
-    const auto adapter_rel = adapters.lexically_relative(root);
-    if (adapter_rel.empty() || *adapter_rel.begin() == "..")
+        ? native_shaders / "runtime" : std::filesystem::path(config.adapter_shaders));
+    if (!inside(adapters))
         throw std::invalid_argument("adapter shaders must be inside NR root");
     if (impl_->scaled) {
         if (mask_config.width) throw std::invalid_argument("the control mask path does not support model_scale below 1");
-        impl_->keep_full = s.ctx.image(config.width, config.height, VK_FORMAT_R32G32B32A32_SFLOAT, true);
-        s.ctx.transition(impl_->keep_full, VK_IMAGE_LAYOUT_GENERAL);
-        impl_->full_out = s.ctx.image(config.width, config.height, VK_FORMAT_R32G32B32A32_SFLOAT, false);
-        s.ctx.transition(impl_->full_out, VK_IMAGE_LAYOUT_GENERAL);
         // The downscale is a blit from the RGBA32F keep; linear filtering on a
         // 32-bit float format is a feature bit, not a given.
         VkFormatProperties fp{}; vkGetPhysicalDeviceFormatProperties(host.physical, VK_FORMAT_R32G32B32A32_SFLOAT, &fp);
         impl_->downscale_filter = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)
             ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+        // The frame kept in its own format (Impl::keep_native) for the formats whose texelFetch is
+        // the blit's own conversion; the store into it where that store is the blit's conversion
+        // too (the formats the post block's own store covers, see direct_out below).
+        // NR_KEEP_RGBA32F=1: the RGBA32F keep and the blits, as before.
+        const VkFormat keep_format = transfer == Transfer::Encoded ? unorm : config.colour_format;
+        const VkFormat cf = config.colour_format;
+        const bool listed = transfer == Transfer::Encoded || cf == VK_FORMAT_R8G8B8A8_UNORM ||
+            cf == VK_FORMAT_B8G8R8A8_UNORM || cf == VK_FORMAT_R16G16B16A16_SFLOAT || cf == VK_FORMAT_R16G16B16A16_UNORM ||
+            cf == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || cf == VK_FORMAT_A2R10G10B10_UNORM_PACK32 ||
+            cf == VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+        const bool store_listed = impl_->round_u8 || cf == VK_FORMAT_R16G16B16A16_SFLOAT ||
+            cf == VK_FORMAT_R16G16B16A16_UNORM || cf == VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+        VkFormatProperties3 k3{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};
+        VkFormatProperties2 k2{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &k3};
+        vkGetPhysicalDeviceFormatProperties2(host.physical, keep_format, &k2);
+        const VkFormatFeatureFlags2 kf = k3.optimalTilingFeatures;
+        const char* old_keep = std::getenv("NR_KEEP_RGBA32F");
+        impl_->keep_native = !(old_keep && std::atoi(old_keep)) && listed && impl_->downscale_filter == VK_FILTER_LINEAR &&
+            s.tex_in.format == VK_FORMAT_R32G32B32A32_SFLOAT && (kf & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT) &&
+            (kf & VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT) && (kf & VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT);
+        impl_->store_native = impl_->keep_native && store_listed && (kf & VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT) &&
+            (kf & VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT);
+        impl_->keep_full = s.ctx.image(config.width, config.height,
+                                       impl_->keep_native ? keep_format : VK_FORMAT_R32G32B32A32_SFLOAT, true, true,
+                                       !impl_->keep_native || impl_->store_native);
+        s.ctx.transition(impl_->keep_full, VK_IMAGE_LAYOUT_GENERAL);
+        if (!impl_->store_native) {
+            impl_->full_out = s.ctx.image(config.width, config.height, VK_FORMAT_R32G32B32A32_SFLOAT, false);
+            s.ctx.transition(impl_->full_out, VK_IMAGE_LAYOUT_GENERAL);
+        }
+        for (auto* im : {&impl_->up_result, &impl_->up_shown}) {
+            *im = s.ctx.image(config.width, config.height, VK_FORMAT_R32G32B32A32_SFLOAT, false);
+            s.ctx.transition(*im, VK_IMAGE_LAYOUT_GENERAL);
+        }
+        if (impl_->keep_native) {
+            // Where the blit samples: a frame-sized probe holding each texel's column and row,
+            // blitted down as the frame would be, read back into `taps` on the GPU. Frame and
+            // model sized RGBA32F for the length of one submission.
+            const uint32_t W = config.width, H = config.height;
+            impl_->taps = s.ctx.buffer(VkDeviceSize(mw + mh) * 8);
+            auto probe = s.ctx.image(W, H, VK_FORMAT_R32G32B32A32_SFLOAT, false, false);
+            auto probed = s.ctx.image(mw, mh, VK_FORMAT_R32G32B32A32_SFLOAT, false, false);
+            probe.layout = probed.layout = VK_IMAGE_LAYOUT_GENERAL;
+            nrvk::Kernel taps_k;
+            taps_k.create(s.ctx, (adapters / "runtime_taps.spv").string(), {impl_->taps.handle}, 12, {&probe, &probed});
+            s.ctx.one_shot([&](VkCommandBuffer cmd) {
+                barrier(cmd, probe.handle, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+                const uint32_t fill[] = {W, H, 0u};
+                dispatch(cmd, taps_k, (W + 63) / 64, H, 1, fill, sizeof fill);
+                barrier(cmd, probe.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                barrier(cmd, probed.handle, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+                VkImageBlit down{};
+                down.srcSubresource = down.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                down.srcOffsets[1] = {int32_t(W), int32_t(H), 1};
+                down.dstOffsets[1] = {int32_t(mw), int32_t(mh), 1};
+                vkCmdBlitImage(cmd, probe.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               probed.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &down, impl_->downscale_filter);
+                barrier(cmd, probed.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+                const uint32_t read[] = {mw, mh, 1u};
+                dispatch(cmd, taps_k, (mw + mh + 63) / 64, 1, 1, read, sizeof read);
+                compute_barrier(cmd);
+            });
+            taps_k.destroy();
+            s.ctx.destroy(probe); s.ctx.destroy(probed);
+            nrvk::Context::Image tex_in_storage = s.tex_in;
+            tex_in_storage.sampler = VK_NULL_HANDLE;
+            tex_in_storage.layout = VK_IMAGE_LAYOUT_GENERAL;
+            impl_->downscale.create(s.ctx, (adapters / "runtime_downscale.spv").string(), {impl_->taps.handle}, 8,
+                                    {&impl_->keep_full, &tex_in_storage});
+        }
+        nr::logf("[nr] Model resolution %ux%u: frame kept %s, answer %s", mw, mh,
+                 impl_->keep_native ? "in its own format" : "as RGBA32F",
+                 impl_->store_native ? "stored in its own format" : "RGBA32F, converted on the way back");
     }
     if (config.max_passes > 1) {
         if (mask_config.width) throw std::invalid_argument("the control mask path does not support more than one pass");
@@ -976,10 +1406,14 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     // The alpha pass restores the frame's own alpha onto the answer: the answer
     // is full_out when scaled, and the frame's alpha lives wherever the frame
     // was kept.
-    nrvk::Context::Image* answer = impl_->scaled ? &impl_->full_out : &s.surf0;
+    // store_native: the answer is written into keep_full (a storage alias of it).
+    nrvk::Context::Image keep_full_storage = impl_->keep_full;
+    keep_full_storage.sampler = VK_NULL_HANDLE;
+    nrvk::Context::Image* answer = impl_->store_native ? &keep_full_storage : impl_->scaled ? &impl_->full_out : &s.surf0;
     nrvk::Context::Image* frame_alpha = impl_->scaled ? &impl_->keep_full
                                         : (config.max_passes > 1 ? &impl_->shown_keep : &s.tex_in);
-    impl_->alpha.create(s.ctx, (adapters / "runtime_alpha.spv").string(), {}, 12, {answer, frame_alpha});
+    if (!impl_->store_native)
+        impl_->alpha.create(s.ctx, (adapters / "runtime_alpha.spv").string(), {}, 12, {answer, frame_alpha});
     if (config.linear_input) {
         impl_->linear = true;
         impl_->white_point = config.white_point;
@@ -1003,12 +1437,20 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     // frame as handed over - the full-resolution copy when scaled, the
     // untouched linear original on the linear path, the frame itself
     // otherwise - and `out` is the full-resolution answer.
+    const char* const transfer_spv = impl_->store_native ? "runtime_transfer_store.spv" : "runtime_transfer.spv";
     {
         nrvk::Context::Image* shown = config.max_passes > 1 ? &impl_->shown_keep : &s.tex_in;
         nrvk::Context::Image* keep = impl_->scaled ? &impl_->keep_full
                                      : impl_->linear ? &impl_->keep : shown;
-        impl_->transfer_pass.create(s.ctx, (adapters / "runtime_transfer.spv").string(), {}, 36,
-                               {&s.surf0, shown, keep, answer});
+        // Unscaled, the two enlargement bindings are never read; the answer stands in.
+        nrvk::Context::Image* up_r = impl_->scaled ? &impl_->up_result : answer;
+        nrvk::Context::Image* up_s = impl_->scaled ? &impl_->up_shown : answer;
+        impl_->transfer_pass.create(s.ctx, (adapters / transfer_spv).string(), {}, sizeof(TransferPush),
+                               {&s.surf0, shown, keep, answer, up_r, up_s});
+        impl_->transfer_binds = {s.surf0, *shown, *keep, *answer, *up_r, *up_s};
+        if (impl_->scaled)
+            impl_->upscale_pass.create(s.ctx, (adapters / "runtime_upscale.spv").string(), {}, 20,
+                                       {&s.surf0, shown, &impl_->up_result, &impl_->up_shown});
     }
     if (config.preprocess && !mask_config.width) {
         impl_->prep = true;
@@ -1035,9 +1477,16 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
             // tex_in was also the frame as handed over, as `keep`.
             nrvk::Context::Image* keep = impl_->scaled ? &impl_->keep_full
                                          : impl_->linear ? &impl_->keep : &impl_->prep_keep;
-            nrvk::Context::Image* answer = impl_->scaled ? &impl_->full_out : &s.surf0;
-            impl_->transfer_prep.create(s.ctx, (adapters / "runtime_transfer.spv").string(), {}, 36,
-                                        {&s.surf0, &impl_->prep_keep, keep, answer});
+            nrvk::Context::Image* answer = impl_->store_native ? &keep_full_storage
+                                           : impl_->scaled ? &impl_->full_out : &s.surf0;
+            nrvk::Context::Image* up_r = impl_->scaled ? &impl_->up_result : answer;
+            nrvk::Context::Image* up_s = impl_->scaled ? &impl_->up_shown : answer;
+            impl_->transfer_prep.create(s.ctx, (adapters / transfer_spv).string(), {},
+                                        sizeof(TransferPush), {&s.surf0, &impl_->prep_keep, keep, answer, up_r, up_s});
+            impl_->transfer_prep_binds = {s.surf0, impl_->prep_keep, *keep, *answer, *up_r, *up_s};
+            if (impl_->scaled)
+                impl_->upscale_prep.create(s.ctx, (adapters / "runtime_upscale.spv").string(), {}, 20,
+                                           {&s.surf0, &impl_->prep_keep, &impl_->up_result, &impl_->up_shown});
         }
     }
     auto require_variant_profile = [&](const std::filesystem::path& directory) {
@@ -1059,8 +1508,11 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         impl_->mask_image=s.ctx.image(mask_config.width,mask_config.height,VK_FORMAT_R32G32B32A32_SFLOAT,true);
         impl_->mask_rect=s.ctx.buffer(24);
         auto& k=impl_->mask_pre;
-        if (s.kern.count("fswinimagepreds32")) {
-            impl_->original_pre=&s.kern.at("fswinimagepreds32");
+        // "fswinimagepreds32nh" is the same kernel without the (never reached) upper
+        // exponent clamp; the mask variant keeps the clamp, which is the same function.
+        const std::string pre_name = s.kern.count("fswinimagepreds32nh") ? "fswinimagepreds32nh" : "fswinimagepreds32";
+        if (s.kern.count(pre_name)) {
+            impl_->original_pre=&s.kern.at(pre_name);
             k.create(s.ctx,(adapters/"mask_pre_fp32.spv").string(),
                 {s.act.handle,s.act.handle,s.wgt.handle,s.wgt.handle,s.wgt.handle,s.act.handle,impl_->mask_rect.handle},
                 sizeof(PushFSwin)+sizeof(PushPreImage),{&s.tex_in,&impl_->mask_image});
@@ -1072,18 +1524,27 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         impl_->mask_resolve.create(s.ctx,(adapters/"runtime_control_mask.spv").string(),
             {impl_->mask_rect.handle},12,{&s.surf0,&s.tex_in,&impl_->mask_image});
     }
+    {
+        const std::string pn = s.kern.count("fswinimagepreds32nh") ? "fswinimagepreds32nh" : "fswinimagepreds32";
+        if (s.kern.count(pn) && s.kern.count("fswinimagepost32")) {
+            impl_->plain_pre = &s.kern.at(pn); impl_->plain_post = &s.kern.at("fswinimagepost32");
+        }
+    }
     if (temporal_config.enable) {
         auto& t = impl_->temporal;
-        const auto shaders = std::filesystem::canonical(temporal_config.shaders.empty()
-            ? (installed ? data / "shaders/temporal" : root / "build/windows/rdna4/network/temporal")
+        // The temporal pre/post blocks are network kernels: the ACO bundle's own SPIR-V when it is in use.
+        auto shaders = std::filesystem::canonical(temporal_config.shaders.empty()
+            ? (!aco.empty() ? std::filesystem::path(aco) / "shaders/temporal"
+               : installed ? data / "shaders/temporal" : root / "build/windows/rdna4/network/temporal")
             : std::filesystem::path(temporal_config.shaders));
         require_variant_profile(shaders);
-        const auto temporal_rel = shaders.lexically_relative(root);
-        if (temporal_rel.empty() || *temporal_rel.begin() == "..")
+        if (!inside(shaders))
             throw std::invalid_argument("temporal shaders must be inside NR root");
-        if (!s.kern.count("fswinimagepreds32") || !s.kern.count("fswinimagepost32"))
+        const bool pre_nh = s.kern.count("fswinimagepreds32nh") != 0;
+        const std::string pre_name = pre_nh ? "fswinimagepreds32nh" : "fswinimagepreds32";
+        if (!s.kern.count(pre_name) || !s.kern.count("fswinimagepost32"))
             throw std::runtime_error("the temporal path requires the fused FP32 image kernels");
-        t.original_pre = &s.kern.at("fswinimagepreds32");
+        t.original_pre = &s.kern.at(pre_name);
         t.original_post = &s.kern.at("fswinimagepost32");
         t.lw[0] = (mw + kTemporalBase - 1) / kTemporalBase;
         t.lh[0] = (mh + kTemporalBase - 1) / kTemporalBase;
@@ -1110,7 +1571,10 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
             NRVK_CHECK(vkCreateSampler(s.ctx.device, &si, nullptr, &sampler));
             return sampler;
         };
-        t.history = s.ctx.image(mw, mh, VK_FORMAT_R32G32B32A32_SFLOAT, true);
+        t.h16 = std::getenv("NR_HIST16") && std::atoi(std::getenv("NR_HIST16")) && config.max_passes == 1 &&
+                std::filesystem::exists(shaders / "temporal_post_fp32h16.spv");
+        const VkFormat hist_format = t.h16 ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+        t.history = s.ctx.image(mw, mh, hist_format, true);
         vkDestroySampler(s.ctx.device, t.history.sampler, nullptr);
         t.history.sampler = linear_sampler();
         // Kept in GENERAL for its whole life: it is a transfer destination once
@@ -1159,7 +1623,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         }
         t.pingpong = config.max_passes == 1;
         if (t.pingpong) {
-            t.history_b = s.ctx.image(mw, mh, VK_FORMAT_R32G32B32A32_SFLOAT, true);
+            t.history_b = s.ctx.image(mw, mh, t.history.format, true);
             vkDestroySampler(s.ctx.device, t.history_b.sampler, nullptr);
             t.history_b.sampler = linear_sampler();
             s.ctx.transition(t.history_b, VK_IMAGE_LAYOUT_GENERAL);
@@ -1169,6 +1633,16 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         auto storage_of = [](const nrvk::Context::Image& im) {
             nrvk::Context::Image a = im; a.sampler = VK_NULL_HANDLE; return a;
         };
+        {
+            const bool tp_nh0 = pre_nh && std::filesystem::exists(shaders / "temporal_pre_fp32nh.spv");
+            t.hp = std::getenv("NR_HPASS") && std::atoi(std::getenv("NR_HPASS")) &&
+                   std::filesystem::exists(shaders / (tp_nh0 ? "temporal_pre_fp32nhhp.spv" : "temporal_pre_fp32hp.spv")) &&
+                   std::filesystem::exists(shaders / "temporal_post_fp32hp.spv");
+            if (t.hp) {
+                t.hpass = s.ctx.image(mw, mh, VK_FORMAT_R32G32B32A32_SFLOAT, false);
+                s.ctx.transition(t.hpass, VK_IMAGE_LAYOUT_GENERAL);
+            }
+        }
         nrvk::Context::Image (&hist_store)[2] = t.hist_store;
         hist_store[0] = storage_of(t.hist(0)); hist_store[1] = storage_of(t.hist(1));
         t.pre_buffers = {s.act.handle, s.act.handle, s.wgt.handle, s.wgt.handle, s.wgt.handle,
@@ -1178,19 +1652,27 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         for (unsigned c = 0; c < (t.pingpong ? 2u : 1u); ++c) {
             nrvk::Kernel& pre = t.pingpong ? t.pre_pp[c] : t.pre;
             nrvk::Kernel& post = t.pingpong ? t.post_pp[c] : t.post;
-            pre.create(s.ctx, (shaders / "temporal_pre_fp32.spv").string(),
+            // the no-upper-clamp temporal pre when the graph's pre qualified and the
+            // package has it (the clamped one is the same function there).
+            const bool tp_nh = pre_nh && std::filesystem::exists(shaders / "temporal_pre_fp32nh.spv");
+            // (research NR_HPASS=1): the pre block hands the post its history.
+            const std::string pre_spv = std::string(tp_nh ? "temporal_pre_fp32nh" : "temporal_pre_fp32") + (t.hp ? "hp.spv" : ".spv");
+            pre.create(s.ctx, (shaders / pre_spv).string(),
                        {s.act.handle, s.act.handle, s.wgt.handle, s.wgt.handle, s.wgt.handle,
                         s.act.handle, t.params.handle},
                        sizeof(PushFSwin) + sizeof(PushPreImage),
-                       {&s.tex_in, &t.flow0_sampled, &t.hist(c), &t.depth});
+                       t.hp ? std::vector<nrvk::Context::Image*>{&s.tex_in, &t.flow0_sampled, &t.hist(c), &t.depth, &t.hpass}
+                            : std::vector<nrvk::Context::Image*>{&s.tex_in, &t.flow0_sampled, &t.hist(c), &t.depth});
             // The post variant reads the same parameter buffer, the motion field and
             // the history the pre variant does: its blend is gated by the same term.
-            post.create(s.ctx, (shaders / "temporal_post_fp32.spv").string(),
+            post.create(s.ctx, (shaders / (t.hp ? "temporal_post_fp32hp.spv" : t.h16 ? "temporal_post_fp32h16.spv" : "temporal_post_fp32.spv")).string(),
                         {s.act.handle, s.act.handle, s.wgt.handle, s.wgt.handle, s.wgt.handle,
                          t.params.handle},
                         sizeof(PushFSwin) + sizeof(PushUps) + sizeof(PushImageTail),
-                        {&s.surf0, t.pingpong ? &hist_store[c ^ 1u] : &s.surf1, &s.tex_in,
-                         &t.flow0_sampled, &t.hist(c)});
+                        t.hp ? std::vector<nrvk::Context::Image*>{&s.surf0, t.pingpong ? &hist_store[c ^ 1u] : &s.surf1, &s.tex_in,
+                                                                         &t.flow0_sampled, &t.hist(c), &t.hpass}
+                             : std::vector<nrvk::Context::Image*>{&s.surf0, t.pingpong ? &hist_store[c ^ 1u] : &s.surf1, &s.tex_in,
+                                                                         &t.flow0_sampled, &t.hist(c)});
         }
         t.history_strength = temporal_config.history_strength;
         t.enabled = true;
@@ -1272,6 +1754,15 @@ void Runtime::release_feature(uint64_t feature) {
     if (impl_->bound_feature == feature) impl_->bound_feature = 0;
 }
 
+void Runtime::drop_history() {
+    // A recording that advanced the temporal state (latch, parity, seed, the bound feature's copies)
+    // never ran. Every feature starts again as on its first frame: the gate stays closed until a
+    // recording that does run has written its history, and a fresh image is cleared before use.
+    impl_->temporal.latch = false;
+    for (auto& f : impl_->features) { f.second.latch = false; f.second.cleared = false; }
+    impl_->bound_feature = 0;
+}
+
 uint32_t Runtime::live_features() const { return uint32_t(impl_->features.size()); }
 
 Runtime::TemporalHistoryView Runtime::temporal_history() const {
@@ -1307,6 +1798,11 @@ TemporalResult Runtime::record_temporal(VkCommandBuffer cmd, const ColourFrame& 
     // never be reported as engine data.
     result.motion_provider = "estimated";
     return result;
+}
+
+bool Runtime::takes_target(const Controls& c) const {
+    return c.enabled && c.apply_model && impl_->temporal.enabled &&
+           std::min<uint32_t>(std::max(c.passes, 1), impl_->max_passes) == 1;
 }
 
 EngineResult Runtime::record_engine(VkCommandBuffer cmd, const EngineFrame& frame,
@@ -1352,6 +1848,15 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
             t.after==VK_IMAGE_LAYOUT_PREINITIALIZED)
             throw std::invalid_argument("invalid/unconfigured external control mask");
     }
+    // the one fallible allocation of a recording - a new feature's
+    // history image - before anything is recorded, so a failure leaves the caller's
+    // images in the layouts it gave and its fallback (seed copy, in place) sound.
+    if (c.enabled && temporal && impl_->temporal.enabled && temporal->feature && !impl_->features.count(temporal->feature)) {
+        const auto& th = impl_->temporal.history;
+        Impl::FeatureState made{};
+        made.history = impl_->session.ctx.image(th.w, th.h, th.format, false, false);
+        impl_->features.emplace(temporal->feature, made);
+    }
     ControlMaskResult result{};
     auto& info=result.frame;
     info.effective_skin = c.automatic_mask ? (c.skin_structure < 0 ? c.local_structure : c.skin_structure) : -1;
@@ -1369,8 +1874,8 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     // Timed from here: a disabled pass records nothing and is not a cost.
     const uint32_t timing_slot = impl_->timing_slot;
     if (impl_->timing_ok) {
-        vkCmdResetQueryPool(cmd, impl_->timing, timing_slot * 2, 2);
-        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, impl_->timing, timing_slot * 2);
+        vkCmdResetQueryPool(cmd, impl_->timing, timing_slot * impl_->timing_stride, impl_->timing_stride);
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, impl_->timing, timing_slot * impl_->timing_stride);
     }
     auto& s = impl_->session;
     Controls effective=c;
@@ -1402,9 +1907,21 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                 VK_ACCESS_TRANSFER_READ_BIT,t.after_stage,t.after_access);
     }
     impl_->controls(effective);
+    impl_->check_read();
+    if (engine && temporal)
+        impl_->incheck.begin(s.ctx, cmd, frame, *engine, temporal->feature, impl_->recordings,
+                             impl_->temporal.lw[0], impl_->temporal.lh[0], impl_->mw, impl_->mh);
     // The network extent (Model Resolution); the frame is frame.width x frame.height.
     const uint32_t nw = impl_->mw, nh = impl_->mh;
     const uint32_t passes = std::min<uint32_t>(std::max(effective.passes, 1), impl_->max_passes);
+    // a separate answer image (EngineFrame::target).
+    const ColourFrame* tgt = engine && engine->target.image && engine->target.image != frame.image ? &engine->target : nullptr;
+    if (tgt && (!c.apply_model || passes != 1 || mask || tgt->format != frame.format ||
+                tgt->width != frame.width || tgt->height != frame.height || !tgt->before_stage || !tgt->after_stage ||
+                tgt->before == VK_IMAGE_LAYOUT_PREINITIALIZED || tgt->after == VK_IMAGE_LAYOUT_UNDEFINED ||
+                tgt->after == VK_IMAGE_LAYOUT_PREINITIALIZED))
+        throw std::invalid_argument("invalid NR target frame");
+    const VkImage wb = tgt ? tgt->image : frame.image;
     // The caller's colour (and depth) sampled in place, when this frame allows
     // it: see Impl::DirectSrc. Null means the copies below, as always.
     const Impl::DirectSrc* ds = nullptr;
@@ -1414,34 +1931,78 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         NR_DIRECT_SAMPLE && !impl_->direct_src_failed && impl_->post_alpha && !impl_->prep && engine &&
         temporal && !mask && passes == 1 &&
         impl_->temporal.pingpong && impl_->transfer != Transfer::Encoded &&
-        (frame.usage & VK_IMAGE_USAGE_SAMPLED_BIT) && frame.width == nw && frame.height == nh &&
-        (!engine->depth.image || (engine->depth.format == VK_FORMAT_R32_SFLOAT &&
-                                  (engine->depth.usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
-                                  engine->depth_x == 0 && engine->depth_y == 0 &&
-                                  engine->depth.width == impl_->temporal.depth.w &&
-                                  engine->depth.height == impl_->temporal.depth.h));
+        (frame.usage & VK_IMAGE_USAGE_SAMPLED_BIT) && frame.width == nw && frame.height == nh;
+    // the depth in place is a separate question. A depth that still needs its blit or
+    // conversion (render-resolution guides after SR, a subrect, depth/stencil) goes through
+    // t.depth as before, and the colour is sampled in place (and the answer stored) anyway.
+    const bool depth_in_place = colour_direct && engine->depth.image &&
+        engine->depth.format == VK_FORMAT_R32_SFLOAT && (engine->depth.usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
+        engine->depth_x == 0 && engine->depth_y == 0 &&
+        engine->depth.width == impl_->temporal.depth.w && engine->depth.height == impl_->temporal.depth.h;
     // The motion vectors in place: any engine frame with one pass and the
     // ping-pong sets, a sampled image and a linearly filterable format.
     const bool motion_direct =
         NR_DIRECT_MOTION && !impl_->motion_src_failed && engine && temporal && !mask && passes == 1 &&
         impl_->temporal.pingpong && engine->motion.image &&
         (engine->motion.usage & VK_IMAGE_USAGE_SAMPLED_BIT) && impl_->filters_linearly(engine->motion.format);
+    // (research NR_DIRECT_STORE=1): the post block stores into the frame itself.
+    // With a separate target (storage-capable) the post block stores into it and the
+    // write-back copy goes (4K RGBA16F -0.15 ms). In place (the post samples only its own
+    // pixel, NEAREST, before it stores it) for 64-bit frames: 4K RGBA16F -0.05 ms; bgra8
+    // ties (its copy stays in the cache). NR_DIRECT_STORE=0: never; =1: in place for any format.
+    static const int direct_store_env = std::getenv("NR_DIRECT_STORE") ? std::atoi(std::getenv("NR_DIRECT_STORE")) : -1;
+    const bool wide = frame.format == VK_FORMAT_R16G16B16A16_SFLOAT || frame.format == VK_FORMAT_R16G16B16A16_UNORM;
+    const bool store_direct = colour_direct && impl_->direct_out && c.apply_model && frame.format == s.surf0.format &&
+        !impl_->scaled && direct_store_env != 0 &&
+        (tgt ? (tgt->usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0
+             : (direct_store_env == 1 || wide) && (frame.usage & VK_IMAGE_USAGE_STORAGE_BIT));
+    // the plain path (no temporal, no engine frame) samples the caller's colour in place
+    // too - the input copy goes. Research switch NR_PLAIN_DIRECT=0 turns it off.
+    static const bool plain_env = !(std::getenv("NR_PLAIN_DIRECT") && !std::atoi(std::getenv("NR_PLAIN_DIRECT")));
+    const bool plain_direct = plain_env && !temporal && !engine && !mask && passes == 1 && impl_->plain_pre &&
+        impl_->plain_post && !impl_->direct_src_failed && impl_->post_alpha && !impl_->prep && !impl_->linear &&
+        impl_->transfer != Transfer::Encoded && (frame.usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
+        frame.width == nw && frame.height == nh;
+    const bool plain_store = plain_direct && impl_->direct_out && c.apply_model && frame.format == s.surf0.format &&
+        !impl_->scaled && direct_store_env != 0 && (direct_store_env == 1 || wide) &&
+        (frame.usage & VK_IMAGE_USAGE_STORAGE_BIT);
     const Impl::DirectSrc* sets = nullptr;
-    if (colour_direct || motion_direct)
+    if (plain_direct)
+        sets = impl_->direct_source(frame.image, frame.format, VK_NULL_HANDLE, VK_NULL_HANDLE,
+                                    VK_FORMAT_UNDEFINED, 0, plain_store, VK_NULL_HANDLE, true);
+    else if (colour_direct || motion_direct)
         sets = impl_->direct_source(colour_direct ? frame.image : VK_NULL_HANDLE, frame.format,
-                                    colour_direct ? engine->depth.image : VK_NULL_HANDLE,
+                                    depth_in_place ? engine->depth.image : VK_NULL_HANDLE,
                                     motion_direct ? engine->motion.image : VK_NULL_HANDLE,
-                                    engine->motion.format, impl_->temporal.hcur);
+                                    engine->motion.format, impl_->temporal.hcur, store_direct,
+                                    tgt ? tgt->image : VK_NULL_HANDLE);
     if (sets && sets->cview) ds = sets;
+    // Model resolution with the frame read and written in place (Impl::FrameRw). NR_FRAME_RW=0: never.
+    static const bool frame_rw_env = !(std::getenv("NR_FRAME_RW") && !std::atoi(std::getenv("NR_FRAME_RW")));
+    const Impl::FrameRw* fr = frame_rw_env && impl_->store_native && impl_->scaled && !tgt && !mask &&
+        (frame.usage & VK_IMAGE_USAGE_SAMPLED_BIT) && (frame.usage & VK_IMAGE_USAGE_STORAGE_BIT) &&
+        frame.format == impl_->keep_full.format && frame.width == impl_->keep_full.w && frame.height == impl_->keep_full.h
+        ? impl_->frame_rw_source(frame.image, frame.format) : nullptr;
+    const bool stored = (ds && ds->store) || fr;
+    const bool depth_direct = ds && ds->dview != VK_NULL_HANDLE;   // the caller's depth bound in place
     const bool mv_direct = sets && sets->mview;
-    barrier(cmd, frame.image, frame.before, ds ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+    barrier(cmd, frame.image, frame.before, ds || fr ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             frame.before_stage, frame.before_access,
-            ds ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT,
-            ds ? VK_ACCESS_SHADER_READ_BIT : VK_ACCESS_TRANSFER_READ_BIT);
+            ds || fr ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT,
+            stored && !tgt ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
+                   : ds ? VK_ACCESS_SHADER_READ_BIT : VK_ACCESS_TRANSFER_READ_BIT);
+    if (stored && tgt)
+        barrier(cmd, tgt->image, tgt->before, VK_IMAGE_LAYOUT_GENERAL, tgt->before_stage, tgt->before_access,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+    // Where tex_in stands once the frame is in it: a copy or blit leaves it a transfer
+    // destination, runtime_downscale.comp (keep_native) a storage image.
+    const bool down_native = impl_->scaled && impl_->keep_native;
+    const VkImageLayout tin_layout = down_native ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    const VkPipelineStageFlags tin_stage = down_native ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT;
+    const VkAccessFlags tin_access = down_native ? VK_ACCESS_SHADER_WRITE_BIT : VK_ACCESS_TRANSFER_WRITE_BIT;
     if (!ds)
-    barrier(cmd, s.tex_in.handle, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    barrier(cmd, s.tex_in.handle, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, tin_layout,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT, tin_stage, tin_access);
     VkImageCopy region{};
     region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.extent = {frame.width, frame.height, 1};
@@ -1453,13 +2014,19 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     // then is filtered down into tex_in. Whatever the frame's format, the
     // downscale is one RGBA32F -> RGBA32F blit.
     VkImage colour_dst = s.tex_in.handle;
-    if (impl_->scaled) {
+    if (impl_->scaled && !fr) {
         colour_dst = impl_->keep_full.handle;
         barrier(cmd, impl_->keep_full.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     }
-    if (ds) {
+    if (fr) {
+        // Nothing to copy: the downscale and the transfer pass read the frame itself.
+    } else if (down_native) {
+        // The frame's bits as they are (an *_SRGB frame into its UNORM twin).
+        vkCmdCopyImage(cmd, frame.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       colour_dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    } else if (ds) {
         // Nothing to copy: the pre and post blocks sample the frame itself.
     } else if (impl_->direct_in) {
         // The bits as they are (an *_SRGB frame into its UNORM twin: the same
@@ -1490,7 +2057,14 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         vkCmdCopyImage(cmd, frame.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                        colour_dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
     }
-    if (impl_->scaled) {
+    if (down_native) {
+        if (!fr)
+            barrier(cmd, impl_->keep_full.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+        const uint32_t model[] = {nw, nh};
+        dispatch(cmd, impl_->downscale, (nw + 7) / 8, (nh + 7) / 8, 1, model, sizeof model, fr ? fr->down : VK_NULL_HANDLE);
+    } else if (impl_->scaled) {
         barrier(cmd, impl_->keep_full.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -1507,8 +2081,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     if (impl_->linear) {
         // Linear light: make the proxy in place and keep the original. The
         // network reads tex_in in SHADER_READ_ONLY like every other frame.
-        barrier(cmd, s.tex_in.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+        barrier(cmd, s.tex_in.handle, tin_layout, VK_IMAGE_LAYOUT_GENERAL, tin_stage, tin_access,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
         struct { uint32_t w, h; float white, knee; } push{nw, nh, impl_->white_point, 0.75f};
         dispatch(cmd, impl_->encode, (nw + 7) / 8, (nh + 7) / 8, 1, &push, sizeof push);
@@ -1516,8 +2089,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
     } else if (!ds) {
-        barrier(cmd, s.tex_in.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+        barrier(cmd, s.tex_in.handle, tin_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, tin_stage, tin_access,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
     }
     // Preprocess: meter the frame, keep it, and put what the network is to see
@@ -1629,6 +2201,9 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         uint32_t& counter = fs ? fs->seed : t.seed;
         if (!(fs ? fs->latch : t.latch) || temporal->reset) counter = 0;
         pre_seed = counter++;
+        // diagnostics (wrong picture): price the per-frame noise and the history.
+        if (std::getenv("NR_DIAG_SEED0")) pre_seed = 0;
+        if (std::getenv("NR_DIAG_TGATE0")) gate = false;
         const uint32_t p = fs ? fs->parity : t.parity;
         if (engine) {
             // Engine motion: sampled in place (mv_direct, put back after the
@@ -1666,7 +2241,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
             // image, so the consumer has a single descriptor whether or not the
             // game supplies depth this frame.
             impl_->depth_unread = false;
-            if (engine->depth.image && ds) {
+            if (engine->depth.image && depth_direct) {
                 // Sampled in place (Impl::DirectSrc); put back after the passes.
                 barrier(cmd, engine->depth.image, engine->depth.before, VK_IMAGE_LAYOUT_GENERAL,
                         engine->depth.before_stage, engine->depth.before_access,
@@ -1855,12 +2430,17 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
             if (temporal) copy_general(impl_->history_store[pass], t.history);
         }
+        const bool time_net = impl_->timing_ok && impl_->split_timing;
+        const uint32_t net_query = timing_slot * impl_->timing_stride + 2 + 2 * pass;
+        if (time_net) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, impl_->timing, net_query);
         for (size_t i = 0; i < s.steps.size(); ++i) {
             const auto& step = s.steps[i];
             const nrvk::Kernel* use = step.k;
             if (mask && step.k==impl_->original_pre) use = &impl_->mask_pre;
             VkDescriptorSet set = VK_NULL_HANDLE;
             if (mask && step.k==impl_->original_pre) {}
+            else if (!temporal && ds && step.k==impl_->plain_pre) set = ds->pre[0];
+            else if (!temporal && ds && step.k==impl_->plain_post) set = ds->post[0];
             else if (temporal && step.k==t.original_pre) {
                 use = t.pingpong ? &t.pre_pp[t.hcur] : &t.pre;
                 if (sets) set = sets->pre[t.hcur];
@@ -1893,9 +2473,12 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
             // either contract - they were not built with device-scoped loads
             // and the arena is not the only thing they read.
             const bool last = i + 1 >= s.steps.size();
+            // C=512 dispatches joined by tile counters (nr_graph.cpp NR_TCHAIN) have no barrier.
+            if (!last && i < s.runner.no_barrier_after.size() && s.runner.no_barrier_after[i]) continue;
             compute_barrier(cmd, s.runner.exec_barrier && !last,
                             s.runner.inv_barrier && !last);
         }
+        if (time_net) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, impl_->timing, net_query + 1);
         if (temporal && !t.pingpong) {
             // History is a copy of what the MODEL wrote - the temporal post variant
             // puts that on the second surface, before the application strength -
@@ -1933,6 +2516,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         if (t.pingpong) t.hcur ^= 1u;
         if (history_consumed) *history_consumed = gate;
     }
+    impl_->check_record(cmd);
     // Retired features, destroyed once enough recordings have gone by that the
     // submission holding their last use cannot still be executing.
     ++impl_->recordings;
@@ -1971,30 +2555,53 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
             // The model's answer onto the frame, as OptiScaler DLSS-NR's
             // resolve; see the shader. At the frame extent; the model-sized
             // answer is sampled.
-            struct { uint32_t w, h, model_w, model_h, passthrough; float detail, colour, max_ratio, white; }
-                push{frame.width, frame.height, nw, nh, impl_->linear ? 0u : 1u,
-                     c.detail_strength, c.colour_strength, c.max_ratio, impl_->white_point};
-            const nrvk::Kernel& transfer =
-                prep_on && impl_->transfer_prep.device ? impl_->transfer_prep : impl_->transfer_pass;
-            dispatch(cmd, transfer, (frame.width + 7) / 8, (frame.height + 7) / 8, 1, &push, sizeof push);
+            const bool prep_variant = prep_on && impl_->transfer_prep.device;
+            // runtime_transfer.comp's mode: 0 classic, 1 matched residual, 2 edge-aware
+            static const uint32_t kShaderMode[3] = {1u, 2u, 0u};
+            const int enlargement = std::clamp(c.transfer, 0, 2);
+            const uint32_t mode = kShaderMode[enlargement];
+            const uint32_t scaler = uint32_t(std::clamp(c.classic_scaler, 0, 3));
+            const bool enlarge = impl_->scaled && enlargement == kEnlargeClassic && scaler != 0;
+            if (enlarge) {
+                const uint32_t up[] = {frame.width, frame.height, nw, nh, scaler};
+                dispatch(cmd, prep_variant ? impl_->upscale_prep : impl_->upscale_pass,
+                         (frame.width + 7) / 8, (frame.height + 7) / 8, 1, up, sizeof up);
+                compute_barrier(cmd);
+            }
+            const TransferPush push{frame.width, frame.height, nw, nh, impl_->linear ? 0u : 1u,
+                                    c.detail_strength, c.colour_strength, c.max_ratio, impl_->white_point, mode,
+                                    (enlarge ? kTransferEnlarged : 0u) | (c.transfer_guided ? kTransferGuided : 0u) |
+                                        (impl_->store_native && impl_->round_u8 ? kTransferRoundU8 : 0u),
+                                    c.transfer_sigma};
+            const nrvk::Kernel& transfer = prep_variant ? impl_->transfer_prep : impl_->transfer_pass;
+            dispatch(cmd, transfer, (frame.width + 7) / 8, (frame.height + 7) / 8, 1, &push, sizeof push,
+                     fr ? (prep_variant ? fr->transfer_prep : fr->transfer) : VK_NULL_HANDLE);
             compute_barrier(cmd);
         }
-        const VkImage out = impl_->scaled ? impl_->full_out.handle : s.surf0.handle;
+        const VkImage out = impl_->store_native ? impl_->keep_full.handle
+                            : impl_->scaled ? impl_->full_out.handle : s.surf0.handle;
         const uint32_t extent[] = {frame.width, frame.height, uint32_t(impl_->round_u8)};
-        if (!impl_->post_alpha || mask)
+        if ((!impl_->post_alpha || mask) && !impl_->store_native)
             dispatch(cmd, impl_->alpha, (frame.width + 7) / 8, (frame.height + 7) / 8, 1, extent, sizeof extent);
+        if (stored) {
+            // The post block's store was the write-back.
+        } else {
         barrier(cmd, out, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        if (tgt)
+            barrier(cmd, tgt->image, tgt->before, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    tgt->before_stage, tgt->before_access, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        else
         barrier(cmd, frame.image, ds ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 ds ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT,
                 ds ? VK_ACCESS_SHADER_READ_BIT : VK_ACCESS_TRANSFER_READ_BIT,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-        if (impl_->direct_out) {
+        if (impl_->direct_out || impl_->store_native) {
             // Already the frame's bits (an *_SRGB frame takes its UNORM twin's).
             vkCmdCopyImage(cmd, out, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           frame.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+                           wb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
         } else if(encoded.handle) {
             barrier(cmd,encoded.handle,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_READ_BIT,
@@ -2005,28 +2612,43 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                     VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT,
                     VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_READ_BIT);
             vkCmdCopyImage(cmd,encoded.handle,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           frame.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&region);
+                           wb,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&region);
             barrier(cmd,encoded.handle,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_GENERAL,
                     VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_READ_BIT,
                     VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_READ_BIT|VK_ACCESS_TRANSFER_WRITE_BIT);
         } else if (impl_->transfer == Transfer::DirectBlit) {
             vkCmdBlitImage(cmd, out, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           frame.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+                           wb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
         } else {
             vkCmdCopyImage(cmd, out, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           frame.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+                           wb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
         }
         barrier(cmd, out, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        }
         info.applied = true;
     }
+    if (tgt) {
+        barrier(cmd, frame.image, ds ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, frame.after,
+                ds ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT,
+                ds ? VK_ACCESS_SHADER_READ_BIT : VK_ACCESS_TRANSFER_READ_BIT, frame.after_stage, frame.after_access);
+        if (stored)
+            barrier(cmd, tgt->image, VK_IMAGE_LAYOUT_GENERAL, tgt->after, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_ACCESS_SHADER_WRITE_BIT, tgt->after_stage, tgt->after_access);
+        else
+        barrier(cmd, tgt->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, tgt->after, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT, tgt->after_stage, tgt->after_access);
+    } else if (stored)
+        barrier(cmd, frame.image, VK_IMAGE_LAYOUT_GENERAL, frame.after, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_ACCESS_SHADER_WRITE_BIT, frame.after_stage, frame.after_access);
+    else
     barrier(cmd, frame.image, c.apply_model ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
                               : ds ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             frame.after, c.apply_model || !ds ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             c.apply_model ? VK_ACCESS_TRANSFER_WRITE_BIT : ds ? VK_ACCESS_SHADER_READ_BIT : VK_ACCESS_TRANSFER_READ_BIT,
             frame.after_stage, frame.after_access);
-    if (ds && engine->depth.image)
+    if (depth_direct)
         barrier(cmd, engine->depth.image, VK_IMAGE_LAYOUT_GENERAL, engine->depth.after,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
                 engine->depth.after_stage, engine->depth.after_access);
@@ -2034,9 +2656,14 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         barrier(cmd, engine->motion.image, VK_IMAGE_LAYOUT_GENERAL, engine->motion.after,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
                 engine->motion.after_stage, engine->motion.after_access);
+    if (engine && temporal)
+        impl_->incheck.end(s.ctx, cmd, tgt && (tgt->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ? *tgt : frame, *engine, impl_->temporal.flow[0], impl_->temporal.depth,
+                           depth_direct, engine->depth.image && !impl_->depth_unread,
+                           history_consumed && *history_consumed, impl_->mw, impl_->mh, mv_direct);
     if (impl_->timing_ok) {
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, impl_->timing,
-                            timing_slot * 2 + 1);
+                            timing_slot * impl_->timing_stride + 1);
+        impl_->slot_passes[timing_slot] = impl_->split_timing ? passes : 0;
         ++impl_->timings_recorded;
         impl_->timing_slot = (timing_slot + 1) % Impl::kTimingSlots;
         // Collect whatever has finished. Never waits; the caller is a render
@@ -2046,8 +2673,18 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     return result;
 }
 
+void set_input_check(bool on, const std::string& folder, int pictures) {
+    incheck::g_folder = folder;
+    incheck::g_dumps_left = pictures;
+    incheck::g_on = on;
+    if (on) nr::logf("[nr] input check on: every ~600 recordings the engine inputs and the output are read back "
+                     "and scored; pictures of the first %d in which the picture moves in %s", pictures,
+                     folder.empty() ? "(none)" : folder.c_str());
+}
+
 float Runtime::last_gpu_ms() const { return impl_->gpu_ms; }
 float Runtime::average_gpu_ms() const { return impl_->gpu_ms_avg; }
+float Runtime::average_network_ms() const { return impl_->split_timing ? impl_->net_ms_avg : 0.0f; }
 std::pair<float, float> Runtime::preprocess_meter() const {
     const float* s = static_cast<const float*>(impl_->prep_state.mapped);
     if (!s || s[1] != 1.0f) return {NAN, NAN};

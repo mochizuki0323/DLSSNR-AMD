@@ -527,6 +527,7 @@ layout(set = 0, binding = 2, std430) readonly buffer WgtE4M3x4 { fe4m3vec4 wgt_e
 #define NR_IMAGE 0
 #endif
 
+#define NR_TC_WBIND 2   // NR_TCHAIN reads its records from the weight buffer
 #include "nr_chain.glsl"
 layout(push_constant) uniform Push {
     uint x_off;     // input activations, e4m3 elements, tile-blocked [tok][C]
@@ -541,6 +542,7 @@ layout(push_constant) uniform Push {
     int shift, shift_y;     // signed offsets in 4-pixel tiles
 #endif
     NR_CHAIN_FIELDS
+    NR_TCHAIN_FIELDS
 } pc;
 
 // PTX 00bd0990, cc_split_swin_16h_qkv_512_fp8: out-of-range
@@ -913,6 +915,15 @@ void main() {
 #endif
     NR_PROF_BEGIN()
     nr_chain_wait()
+    NR_TC_PROLOGUE
+    // NR_TCHAIN: the window's in-image tiles of the input must be written.
+    NR_TC_WAIT_BEGIN
+    for (uint nr_q = 0u; nr_q < 4u; ++nr_q) {
+        const ivec2 nr_t = nr_tile(nr_q);
+        if (all(greaterThanEqual(nr_t, ivec2(0))) && all(lessThan(nr_t, ivec2(pc.tiles_x, pc.tiles_y))))
+            NR_TC_WAIT_TILE(uint(nr_t.y) * pc.tiles_x + uint(nr_t.x))
+    }
+    NR_TC_WAIT_END
     const uint tid  = gl_LocalInvocationID.x;
 #if NR_ATTN_OOB_BRANCH
     // Each wave is 32 consecutive invocations, so tid/32 is one value per
@@ -1563,6 +1574,7 @@ void main() {
     }
     }
     nr_chain_signal()
+    nr_tchain_signal(win)
     NR_OCC_USE(pc.C == 0u, act_f32[0] = 0.0)
     NR_PROF_END(pc.o_off)
 }

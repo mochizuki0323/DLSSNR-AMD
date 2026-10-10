@@ -2,6 +2,7 @@
 // route. Re-read while the game runs.
 #include "nr_pe_config.hpp"
 #include "nr_pe_log.hpp"
+#include "nr_pipeline_binary.hpp"
 
 #include <windows.h>
 #include <algorithm>
@@ -10,6 +11,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -167,6 +170,15 @@ bool parse(const std::string& path, Config& c, bool& legacy) {
         const std::string key = lower(trim(text.substr(0, equals)));
         const std::string value = trim(text.substr(equals + 1));
         if (name == "preprocess") { parse_preprocess_key(c.preprocess, key, value); continue; }
+        if (name == "log") {
+            if (key == "enabled") { if (auto b = parse_bool(value)) c.log_enabled = *b; }
+            else if (key == "clearonstart") { if (auto b = parse_bool(value)) c.log_clear = *b; }
+            continue;
+        }
+        if (name == "network") {
+            if (key == "aco" || key == "aco mode" || key == "acomode") { if (auto b = parse_bool(value)) c.aco = *b; }
+            continue;
+        }
         if (value.empty()) continue;
         auto& k = c.controls;
 
@@ -184,9 +196,19 @@ bool parse(const std::string& path, Config& c, bool& legacy) {
         else if (key == "transferstrength") k.detail_strength = number(value, 0, 2);
         else if (key == "colourstrength" || key == "colour" || key == "color") k.colour_strength = number(value, 0, 4);
         else if (key == "maxratio") k.max_ratio = number(value, 1, 8);
+        else if (key == "transfer") {
+            const int v = std::atoi(value.c_str());   // kEnlarge*, as the add-on menu lists them
+            k.transfer = v >= 0 && v <= 2 ? v : kEnlargeMatched;
+        }
+        else if (key == "classicscaler" || key == "classic_scaler") {
+            const std::string v = lower(value);
+            if (v == "bilinear" || v == "0") k.classic_scaler = 0;
+            else if (v == "catmullrom" || v == "catmull-rom" || v == "1") k.classic_scaler = 1;
+            else if (v == "lanczos" || v == "lanczos3" || v == "2") k.classic_scaler = 2;
+            else if (v == "fsr1" || v == "fsr" || v == "3") k.classic_scaler = 3;
+        }
         else if (key == "history") c.history = number(value, 0, 1);
         else if (key == "whitepoint" || key == "white_point") c.white_point = number(value, 0.01f, 100.0f);
-        else if (key == "verbose") { if (auto b = parse_bool(value)) c.verbose = *b; }
         else if (key.rfind("pass", 0) == 0 && key.size() > 5 && std::isdigit(static_cast<unsigned char>(key[4]))) {
             // Pass<N><Field>, or the old pass<N>_<field>.
             size_t end = 4;
@@ -320,6 +342,82 @@ void write_preprocess(FILE* f, const PreprocessConfig& p) {
         kCurves[std::clamp(v.curve, 0, 6)], v.contrast, v.saturation, p.hotkey.c_str(), p.sound ? 1 : 0);
 }
 
+void write_log(FILE* f, bool enabled, bool clear) {
+    std::fprintf(f,
+        "\n[Log]\n"
+        "; dlssnr-amd.log in the game folder. Takes effect when the game restarts.\n"
+        "\n"
+        "Enabled = %d\n"
+        "; 1 = write the log (default)\n"
+        "; 0 = no log\n"
+        "\n"
+        "ClearOnStart = %d\n"
+        "; 1 = clear the previous log at every game start (default)\n"
+        "; 0 = keep appending to the previous log\n",
+        enabled ? 1 : 0, clear ? 1 : 0);
+}
+
+void write_network(FILE* f, bool aco) {
+    std::fprintf(f,
+        "\n[Network]\n"
+        "; Which compiler makes the network's machine code. Takes effect when the game restarts.\n"
+        "\n"
+        "ACO Mode = %d\n"
+        "; 0 = the AMD driver's own compiler (default)\n"
+        "; 1 = machine code made by the ACO compiler (the one the Linux version uses). When it cannot be used, 0 is\n"
+        ";     used instead and dlssnr-amd.log says why\n",
+        aco ? 1 : 0);
+}
+
+void configure_network(const std::string& folder) {
+    static std::once_flag once;
+    std::call_once(once, [&] {
+        const std::string ini = folder.empty() ? std::string("dlssnr-amd.ini") : folder + "\\dlssnr-amd.ini";
+        bool aco = false;
+        if (FILE* file = std::fopen(ini.c_str(), "r")) {
+            std::string name;
+            char line[512];
+            while (std::fgets(line, sizeof line, file)) {
+                std::string text = line;
+                const auto comment = text.find_first_of(";#");
+                if (comment != std::string::npos) text = text.substr(0, comment);
+                text = trim(text);
+                if (text.empty()) continue;
+                if (text.front() == '[') { name = lower(trim(text.substr(1, text.find(']') - 1))); continue; }
+                const auto equals = text.find('=');
+                if (name != "network" || equals == std::string::npos) continue;
+                const std::string key = lower(trim(text.substr(0, equals)));
+                if (key == "aco" || key == "aco mode" || key == "acomode")
+                    if (auto b = parse_bool(trim(text.substr(equals + 1)))) aco = *b;
+            }
+            std::fclose(file);
+        }
+        if (!aco) return;
+        const std::string root = folder.empty() ? std::string(".") : folder;
+        const std::string data = root + "\\dlssnr-amd", bundle = data + "\\aco";
+        if (GetFileAttributesA((bundle + "\\records").c_str()) == INVALID_FILE_ATTRIBUTES ||
+            GetFileAttributesA((bundle + "\\shaders").c_str()) == INVALID_FILE_ATTRIBUTES) {
+            log("[nr] [Network] ACO Mode = 1, but %s has no ACO network (records\\, shaders\\): the driver's compiler is used",
+                bundle.c_str());
+            return;
+        }
+        // Templates: the native network shaders, under their own name or the one shell-aliases.txt gives
+        // ("<bundle name> <native name>" per line: a kernel the Windows build names otherwise).
+        std::map<std::string, std::string> aliases;
+        if (FILE* file = std::fopen((bundle + "\\shell-aliases.txt").c_str(), "r")) {
+            char a[128], b[128];
+            while (std::fscanf(file, "%127s %127s", a, b) == 2) aliases[a] = b;
+            std::fclose(file);
+        }
+        // The imported binaries are kept in aco-cache\ (made again when the driver or the files change).
+        const std::string cache = data + "\\aco-cache";
+        CreateDirectoryA(cache.c_str(), nullptr);
+        nr::binary::configure(bundle, {bundle + "\\shell", data + "\\shaders", data + "\\shaders\\temporal"}, cache,
+                              std::move(aliases));
+        log("[nr] [Network] ACO Mode = 1: the network runs ACO's machine code from %s", bundle.c_str());
+    });
+}
+
 bool PreprocessFile::poll(const std::string& path, PreprocessConfig& out) {
     const uint64_t stamp = stamp_of(path);
     if (!stamp) {
@@ -328,6 +426,8 @@ bool PreprocessFile::poll(const std::string& path, PreprocessConfig& out) {
         // No file: write one with the defaults, off, so there is something to edit.
         if (FILE* f = std::fopen(path.c_str(), "w")) {
             write_preprocess(f, PreprocessConfig{});
+            write_network(f, false);
+            write_log(f, true, true);
             std::fclose(f);
             stamp_ = stamp_of(path);
         }
@@ -378,6 +478,8 @@ Preprocess PreprocessSwitch::frame(const PreprocessConfig& file) {
     return p;
 }
 
+
+
 double PreprocessSwitch::since_switch() const {
     return switched_ms_ ? double(GetTickCount64() - switched_ms_) / 1000.0 : 1e9;
 }
@@ -423,6 +525,8 @@ bool Config::reload(const std::string& path) {
     return true;
 }
 
+static const char* const kClassicScalers[] = {"bilinear", "catmullrom", "lanczos3", "fsr1"};
+
 void Config::save(const std::string& path) {
     FILE* f = std::fopen(path.c_str(), "w");
     if (!f) return;
@@ -430,7 +534,6 @@ void Config::save(const std::string& path) {
     const auto& k = controls;
     std::fprintf(f,
         "; DLSSNR-AMD-Vulkan ReShade add-on settings; edits take effect when saved, also in game.\n"
-        "; [DlssNr] keys, ranges and defaults are those of OptiScaler DLSS-NR (OptiScaler.ini).\n"
         "[DlssNr]\n"
         "Enabled=%s\n"
         "ApplyModel=%s\n"
@@ -452,12 +555,21 @@ void Config::save(const std::string& path) {
         "TransferStrength=%.3f\n"
         "ColourStrength=%.3f\n"
         "MaxRatio=%.3f\n"
+        "; Below Model resolution 1, how the model's result is enlarged back to full resolution:\n"
+        ";   0 Matched residual (default): the model's change, enlarged, is added to the full-resolution picture\n"
+        ";   1 Edge-aware lighting + colour: the change's lighting and colour are enlarged separately (weighted by the\n"
+        ";     full-resolution picture's edges), then applied to the full-resolution picture\n"
+        ";   2 Classic: the model's output picture is enlarged directly, the way ClassicScaler says\n"
+        "Transfer=%d\n"
+        "; How Transfer=2 enlarges: bilinear, catmullrom, lanczos3, fsr1\n"
+        "ClassicScaler=%s\n"
         "; From the 2nd pass on, each pass can be set on its own: Pass2Style, Pass2Intensity, Pass2LocalStructure,\n"
         "; Pass2LocalTone, Pass2SkinStructure, Pass2AutoMask, and likewise Pass3...\n"
         "; Keys left out inherit the 1st pass, except LocalTone, which defaults to 0.\n",
         flag(k.enabled), flag(k.apply_model), k.passes, flag(unlock_passes), model_scale, k.style,
         k.intensity, k.local_structure, k.local_tone, k.skin_structure, flag(k.automatic_mask),
-        k.detail_strength, k.colour_strength, k.max_ratio);
+        k.detail_strength, k.colour_strength, k.max_ratio, std::clamp(k.transfer, 0, 2),
+        kClassicScalers[std::clamp(k.classic_scaler, 0, 3)]);
     for (int n = 2; n <= kMaxPasses; ++n) {
         const PassOverride& o = pass[size_t(n) - 2];
         if (o.style) std::fprintf(f, "Pass%dStyle=%d\n", n, *o.style);
@@ -472,12 +584,12 @@ void Config::save(const std::string& path) {
         "; How strongly the previous frame's result is blended into this one, 0..1\n"
         "History=%.3f\n"
         "; White point of linear-light input\n"
-        "WhitePoint=%.3f\n"
-        "; Log a line for every skipped frame\n"
-        "Verbose=%s\n",
-        history, white_point, flag(verbose));
+        "WhitePoint=%.3f\n",
+        history, white_point);
     std::fputs("\n", f);
     write_preprocess(f, preprocess);
+    write_network(f, aco);
+    write_log(f, log_enabled, log_clear);
     std::fclose(f);
     stamp_ = stamp_of(path);
 }

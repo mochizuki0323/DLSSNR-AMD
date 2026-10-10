@@ -57,6 +57,8 @@ source windows/build/arch/rdna4.sh
 "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_interop.cpp -o "$out/interop.o"
 "$cxx" "${common[@]}" -I"$minhook/include" -c windows/src/pe/nr_pe_vkdevice.cpp -o "$out/vkdevice.o"
 "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_session.cpp -o "$out/session.o"
+"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_bridge.cpp -o "$out/bridge.o"
+"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_d3d12split.cpp -o "$out/d3d12split.o"
 "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_config.cpp -o "$out/config.o"
 "$cxx" "${common[@]}" -c windows/src/pe/nr_dlssnr_model.cpp -o "$out/model.o"
 "$cxx" "${common[@]}" -c windows/src/pe/nr_dlssnr_forwarder.cpp -o "$out/forwarder.o"
@@ -76,7 +78,7 @@ ldflags=(-ld3d12 -ldxgi -lole32 -static -static-libgcc -static-libstdc++)
 # Vulkan is resolved at run time rather than imported, exactly as in build_package.sh: a static
 # import of vulkan-1.dll forces winevulkan up before the game's graphics stack, which has killed a
 # real game. This link is expected to fail; its failure is the input to the next step.
-shared_objs=("$out/model.o" "$out/session.o" "$out/config.o" "$out/interop.o" "$out/log.o" "$out/crash.o" "$out/vkdevice.o"
+shared_objs=("$out/model.o" "$out/session.o" "$out/bridge.o" "$out/d3d12split.o" "$out/config.o" "$out/interop.o" "$out/log.o" "$out/crash.o" "$out/vkdevice.o"
              "$out/nr_runtime.o" "$out/nr_native_plan.o" "$out"/mh_*.o)
 forwarder_objs=("$out/forwarder.o" "${shared_objs[@]}")
 core_objs=("$out/ngx_core.o" "$out/optifix.o" "${shared_objs[@]}")

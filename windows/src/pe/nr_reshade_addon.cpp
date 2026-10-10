@@ -14,7 +14,7 @@
 // Session: on `reshade_render_technique` for DLSS5_Feed it takes the back
 // buffer, the two guide textures and the depth orientation, and runs the
 // network on the game's own device through the same DXVK / vkd3d-proton
-// interop the standalone module uses. D3D11 and D3D12 here, and Vulkan when
+// interop the standalone module uses. D3D10, D3D11 and D3D12 here, and Vulkan when
 // ReShade is loaded as a Vulkan layer - which under Proton is also how a
 // D3D9 game is reached, since its d3d9.dll is DXVK and ReShade then sees
 // Vulkan rather than the SM3-only D3D9 backend. ReShade provides the events,
@@ -23,6 +23,7 @@
 // Layout: this file sits next to ReShade's own DLL in the game directory, with
 // build/ and artifacts/ beside it, exactly like the standalone module. dlssnr-amd.ini
 // is shared with it.
+#include "nr_pe_bridge.hpp"
 #include "nr_pe_config.hpp"
 #include "nr_pe_interop.hpp"
 #ifndef NR_BUILD_STAMP
@@ -42,6 +43,7 @@
 #include <reshade.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -163,10 +165,15 @@ const nr::Controls& settings() {
         session->set_white_point(config.white_point);
         session->set_max_passes(uint32_t(config.controls.passes));
     }
-        log("[nr] settings reloaded: intensity %.2f tone %.2f structure %.2f skin %.2f mask %d history %.2f passes %d model_scale %.2f",
+        static const char* const transfers[] = {"matched residual", "edge-aware lighting + colour", "classic"};
+        static const char* const scalers[] = {"bilinear", "catmullrom", "lanczos3", "fsr1"};
+        log("[nr] settings reloaded: intensity %.2f tone %.2f structure %.2f skin %.2f mask %d history %.2f passes %d model_scale %.2f"
+            " enlargement %s%s%s",
             config.controls.intensity, config.controls.local_tone, config.controls.local_structure,
             config.controls.skin_structure, int(config.controls.automatic_mask), config.history,
-            config.controls.passes, config.model_scale);
+            config.controls.passes, config.model_scale, transfers[std::clamp(config.controls.transfer, 0, 2)],
+            config.controls.transfer == nr::kEnlargeClassic ? " " : "",
+            config.controls.transfer == nr::kEnlargeClassic ? scalers[std::clamp(config.controls.classic_scaler, 0, 3)] : "");
     }
     if (session) session->set_model_scale(config.model_scale);
     config.controls.preprocess = prep_switch.frame(config.preprocess);
@@ -266,6 +273,27 @@ const char* space_name(color_space cs) {
     }
 }
 
+// Model resolution below 100% reads the back buffer and writes the answer into it in place when the
+// back buffer can be sampled and written as storage; otherwise it is copied out and back. Those two
+// usages are asked for when the swap chain is created, only where they cannot make the creation fail:
+// Vulkan swap chains without other view formats, in an 8-bit UNORM or RGBA16F format (the formats the
+// answer is stored in directly). ReShade does not retry a creation that fails with the add-on's
+// description, so nothing else is touched.
+bool on_create_swapchain(device_api api, swapchain_desc& desc, void*) {
+    // On Windows the D3D10/11/12 games run on the system's D3D and the bridge copies the frame, so only
+    // the Vulkan layer routes (DX9 through DXVK, Vulkan games) use the back buffer in place.
+    if (api != device_api::vulkan) return false;
+    const format f = desc.back_buffer.texture.format;
+    if (f != format::r8g8b8a8_unorm && f != format::b8g8r8a8_unorm && f != format::r16g16b16a16_float) return false;
+    constexpr uint32_t kVkMutableFormat = 0x4;   // VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR
+    if (api == device_api::vulkan && (desc.present_flags & kVkMutableFormat)) return false;
+    const resource_usage want = resource_usage::shader_resource | resource_usage::unordered_access;
+    if ((desc.back_buffer.usage & want) == want) return false;
+    desc.back_buffer.usage |= want;
+    log("[nr] swap chain: back buffers made sampled and storage (format %u)", unsigned(f));
+    return true;
+}
+
 void on_init_swapchain(swapchain* sc, bool) {
     // **Called directly, NOT through rs::call.** That shim exists for MSVC's
     // hidden-pointer struct return and takes that path for any return type it
@@ -318,10 +346,11 @@ bool debug_dump_on() {
 // buffer cannot be.
 unsigned dump_bpp(format f) {
     switch (f) {
-        case format::r8g8b8a8_unorm: case format::r8g8b8a8_unorm_srgb:
-        case format::b8g8r8a8_unorm: case format::b8g8r8a8_unorm_srgb:
-        case format::r10g10b10a2_unorm: case format::r11g11b10_float: return 4;
-        case format::r16g16b16a16_float: return 8;
+        case format::r8g8b8a8_unorm: case format::r8g8b8a8_unorm_srgb: case format::r8g8b8a8_typeless:
+        case format::b8g8r8a8_unorm: case format::b8g8r8a8_unorm_srgb: case format::b8g8r8a8_typeless:
+        case format::b8g8r8x8_unorm: case format::b8g8r8x8_unorm_srgb: case format::b8g8r8x8_typeless:
+        case format::r10g10b10a2_unorm: case format::r10g10b10a2_typeless: case format::r11g11b10_float: return 4;
+        case format::r16g16b16a16_float: case format::r16g16b16a16_typeless: return 8;
         default: return 0;
     }
 }
@@ -337,11 +366,14 @@ float dump_half(uint16_t h) {
 
 void dump_decode(const uint8_t* p, format f, float out[3]) {
     switch (f) {
-        case format::r8g8b8a8_unorm: case format::r8g8b8a8_unorm_srgb:
+        // A typeless back buffer (a Vulkan swapchain with mutable format, as DXVK makes them) holds the bits of
+        // its UNORM view; a 16-bit one is scRGB, half floats.
+        case format::r8g8b8a8_unorm: case format::r8g8b8a8_unorm_srgb: case format::r8g8b8a8_typeless:
             for (int i = 0; i < 3; ++i) out[i] = p[i] / 255.0f; break;
-        case format::b8g8r8a8_unorm: case format::b8g8r8a8_unorm_srgb:
+        case format::b8g8r8a8_unorm: case format::b8g8r8a8_unorm_srgb: case format::b8g8r8a8_typeless:
+        case format::b8g8r8x8_unorm: case format::b8g8r8x8_unorm_srgb: case format::b8g8r8x8_typeless:
             out[0] = p[2] / 255.0f; out[1] = p[1] / 255.0f; out[2] = p[0] / 255.0f; break;
-        case format::r10g10b10a2_unorm: {
+        case format::r10g10b10a2_unorm: case format::r10g10b10a2_typeless: {
             uint32_t v; std::memcpy(&v, p, 4);
             out[0] = (v & 0x3FFu) / 1023.0f; out[1] = ((v >> 10) & 0x3FFu) / 1023.0f;
             out[2] = ((v >> 20) & 0x3FFu) / 1023.0f; break;
@@ -354,7 +386,7 @@ void dump_decode(const uint8_t* p, format f, float out[3]) {
             auto f10 = [](unsigned x) { return x ? std::ldexp((float)((x & 0x1Fu) + 32u), (int)((x >> 5) & 0x1Fu) - 20) : 0.0f; };
             out[0] = f11(r); out[1] = f11(g); out[2] = f10(b); break;
         }
-        case format::r16g16b16a16_float: {
+        case format::r16g16b16a16_float: case format::r16g16b16a16_typeless: {
             uint16_t h[3]; std::memcpy(h, p, 6);
             for (int i = 0; i < 3; ++i) out[i] = dump_half(h[i]);
             break;
@@ -548,7 +580,16 @@ void vulkan_selftest(VkDevice rs_device) {
     vkDestroyImage(h.device, image, nullptr); vkFreeMemory(h.device, memory, nullptr);
 }
 
+// The bridge's own Vulkan device (nr_pe_bridge.hpp) passes through ReShade too when ReShade is injected
+// as dxgi.dll: it is not a game's device and none of these events are about the game.
+bool own_device(device* dev) {
+    if (dev->get_api() != device_api::vulkan) return false;
+    if (nr::pe::bridge::creating_device()) return true;
+    return nr::pe::bridge::is_own_device(reinterpret_cast<VkDevice>(static_cast<uintptr_t>(dev->get_native())));
+}
+
 void on_init_device(device* dev) {
+    if (own_device(dev)) return;
     // On Vulkan this fires from inside the game's vkCreateDevice, after
     // ReShade has wrapped the device's queues (its vkQueueSubmit hook needs
     // that) and before the game has asked for any: the self-test asks itself.
@@ -559,9 +600,13 @@ void on_init_device(device* dev) {
 // dispatch on the handle, so device-level entry points work on it. Inside
 // the call (where ReShade's init_device fires) they do not - the first word
 // of the handle is still the ICD's marker, and vkGetDeviceQueue jumps into it.
-void on_vulkan_device_created(VkDevice device) { vulkan_selftest(device); }
+void on_vulkan_device_created(VkDevice device) {
+    if (nr::pe::bridge::creating_device() || nr::pe::bridge::is_own_device(device)) return;
+    vulkan_selftest(device);
+}
 
 void on_destroy_device(device* dev) {
+    if (own_device(dev)) return;
     // Everything the session made lives on this device's VkDevice.
     std::lock_guard<std::mutex> guard(lock);
     if (session) {
@@ -588,7 +633,7 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
     if (mv_var.handle) rt->get_texture_binding(mv_var, &mv_srv, &mv_srgb);
     if (depth_var.handle) rt->get_texture_binding(depth_var, &d_srv, &d_srgb);
     const resource colour = rs::call(dev, &device::get_resource_from_view, rtv);
-    const resource motion = mv_srv.handle ? rs::call(dev, &device::get_resource_from_view, mv_srv) : resource{};
+    resource motion = mv_srv.handle ? rs::call(dev, &device::get_resource_from_view, mv_srv) : resource{};
     const resource depth = d_srv.handle ? rs::call(dev, &device::get_resource_from_view, d_srv) : resource{};
     if (!colour.handle) return;
     if (!motion.handle && !missing_reported) {
@@ -605,15 +650,18 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
     if (motion.handle) {
         const resource_desc md = rs::call(dev, &device::get_resource_desc, motion);
         if (md.texture.width != w || md.texture.height != h_) {
+            // The vectors are in back-buffer pixels at back-buffer size: another size is not read.
             report("DLSS5_MV is not the back buffer's size; the pass runs without motion");
+            motion = resource{};
         }
     }
     // DLSS5_MV is in pixels at back-buffer size, prev = uv + mv: the consumer's
     // normalized units are one over the extent, and the sign is already ours.
     const float sx = w ? 1.0f / float(w) : 1.0f, sy = h_ ? 1.0f / float(h_) : 1.0f;
     const bool inverted = depth_is_reversed(rt);
+    // Consumed only by a frame that ran: a reload that comes before a frame the pass turns away still
+    // resets the first frame that does run.
     const bool reset = need_reset;
-    need_reset = false;
     if (!vk_loaded) { nr_vk_load(); vk_loaded = true; log("[nr] feed: Vulkan entry points resolved"); }
     // An HDR10 back buffer is PQ (or HLG) over BT.2020, and nothing in this
     // pass decodes either. Running on it anyway would hand the model a picture
@@ -650,7 +698,21 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
             sampling = true;
         }
     }
-    switch (dev->get_api()) {
+    // DXVK builds D3D10 on its D3D11: an ID3D10Device or ID3D10Texture2D answers QueryInterface with the
+    // D3D11 object underneath (src/d3d10/d3d10_device.cpp, d3d10_texture.cpp), and the D3D11 path asks for
+    // every interface it uses that way. So a D3D10 game on DXVK takes the D3D11 path with ReShade's D3D10
+    // natives; the native D3D10 runtime (whose device has no D3D11 underneath) takes the bridge below.
+    device_api api = dev->get_api();
+    if (api == device_api::d3d10) {
+        IUnknown* d11 = nullptr;
+        if (SUCCEEDED(reinterpret_cast<IUnknown*>(dev->get_native())->QueryInterface(__uuidof(ID3D11Device),
+                                                                                      reinterpret_cast<void**>(&d11))) &&
+            d11) {
+            d11->Release();
+            api = device_api::d3d11;
+        }
+    }
+    switch (api) {
     case device_api::d3d11: {
         nr::pe::Session::D3D11Frame f{};
         f.device = reinterpret_cast<IUnknown*>(dev->get_native());
@@ -664,8 +726,45 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
         ran = s.run_d3d11(f, controls);
         break;
     }
+    case device_api::d3d10: {
+        // The native D3D10 runtime (ReShade as dxgi.dll): the bridge with keyed mutexes.
+        nr::pe::Session::D3D11Frame f{};
+        f.device = reinterpret_cast<IUnknown*>(dev->get_native());
+        f.target = reinterpret_cast<IUnknown*>(colour.handle);
+        f.motion = reinterpret_cast<IUnknown*>(motion.handle);
+        f.depth = reinterpret_cast<IUnknown*>(depth.handle);
+        f.depth_inverted = inverted;
+        f.motion_scale_x = sx; f.motion_scale_y = sy;
+        f.reset = reset;
+        f.linear_hdr = linear_hdr;
+        ran = s.run_d3d10(f, controls);
+        break;
+    }
     case device_api::d3d12: {
         auto* device = reinterpret_cast<ID3D12Device*>(dev->get_native());
+        if (s.bridged(device)) {
+            // The native runtime: ReShade's effect list is its own immediate list, so the frame is
+            // handed over at queue level - flush it, copy in, our queue, copy out - and nothing is
+            // recorded into a list ReShade keeps state for.
+            command_queue* queue = rt->get_command_queue();
+            nr::pe::Session::D3D12QueueFrame f{};
+            f.device = device;
+            f.queue = reinterpret_cast<ID3D12CommandQueue*>(queue->get_native());
+            f.flush = [queue] { queue->flush_immediate_command_list(); };
+            f.target = reinterpret_cast<ID3D12Resource*>(colour.handle);
+            f.target_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            // ReShade's shader_resource usage is both shader-resource states.
+            f.motion = reinterpret_cast<ID3D12Resource*>(motion.handle);
+            f.motion_state = D3D12_RESOURCE_STATES(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            f.depth = reinterpret_cast<ID3D12Resource*>(depth.handle);
+            f.depth_state = D3D12_RESOURCE_STATES(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            f.depth_inverted = inverted;
+            f.motion_scale_x = sx; f.motion_scale_y = sy;
+            f.reset = reset;
+            f.linear_hdr = linear_hdr;
+            ran = s.run_d3d12_queue(f, controls);
+            break;
+        }
         auto* list = reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native());
         // ReShade renders its techniques with the back buffer as a render
         // target (DLSS5-Feeder moves it from exactly that state). Move it to
@@ -719,6 +818,12 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
         f.colour = (VkImage)colour.handle;
         f.colour_format = nr::pe::vulkan_colour_format_of(static_cast<DXGI_FORMAT>(cd.texture.format));
         f.width = w; f.height = h_;
+        // ReShade's word on the image's usage, in Vulkan's terms (the runtime reads and writes a
+        // sampled + storage back buffer in place).
+        if ((cd.usage & resource_usage::shader_resource) != 0) f.colour_usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+        if ((cd.usage & resource_usage::unordered_access) != 0) f.colour_usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+        if ((cd.usage & resource_usage::copy_source) != 0) f.colour_usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        if ((cd.usage & resource_usage::copy_dest) != 0) f.colour_usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         if (motion.handle) {
             const resource_desc md = rs::call(dev, &device::get_resource_desc, motion);
             f.motion = (VkImage)motion.handle;
@@ -743,14 +848,19 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
         }
         // ReShade renders techniques with the back buffer as a render target;
         // move it through ReShade's own barriers so its layout tracking and
-        // ours agree: copy source for the pass's read, copy destination for
-        // the result going back in place, render target again after.
+        // ours agree: copy source for the pass's read, render target again
+        // after. The runtime copies the frame out and the answer back itself
+        // and leaves the image as it found it (VulkanFrame::in_place).
         const resource_usage rt = resource_usage::render_target, src = resource_usage::copy_source,
                              dst = resource_usage::copy_dest;
         cl->barrier(1, &colour, &rt, &src);
         f.colour_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        f.in_place = true;
         const VkImage out = s.run_vulkan(h, cmd, f, controls);
-        if (out) {
+        if (out == f.colour) {
+            cl->barrier(1, &colour, &src, &rt);
+            ran = true;
+        } else if (out) {
             cl->barrier(1, &colour, &src, &dst);
             VkImageCopy region{};
             region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -764,7 +874,7 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
         break;
     }
     default:
-        report("this graphics API is not handled by the ReShade add-on (D3D11, D3D12 and Vulkan are)");
+        report("this graphics API is not handled by the ReShade add-on (D3D10, D3D11, D3D12 and Vulkan are)");
         return;
     }
     if (sampling) {
@@ -775,10 +885,12 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
         dump_state.pending = true;
     }
     report(s.status());
+    if (ran) need_reset = false;
     if (ran) ++frames_run; else ++frames_declined;
     if ((frames_run + frames_declined) % 240 == 0)
-        log("[nr] frames: %u enhanced, %u declined; %.2f ms on the GPU; %s", frames_run,
-            frames_declined, s.gpu_ms(), s.vram_line().c_str());
+        log("[nr] frames: %u enhanced, %u declined; %.2f ms on the GPU (network %.2f, route %.2f); %s", frames_run,
+            frames_declined, s.gpu_ms(), s.network_ms(), std::max(s.gpu_ms() - s.network_ms(), 0.0f),
+            s.vram_line().c_str());
 }
 
 // The settings panel, in ReShade's own overlay under this add-on's name. The
@@ -826,10 +938,65 @@ bool model_sliders(float& intensity, float& structure, float& tone, float& skin)
     return changed;
 }
 
+const char* network_name(int int4) { return int4 == 1 ? "INT4 MIXED" : "DEFAULT"; }
+
+// The build's progress as a fraction and a phrase (nr::g_build_stage).
+float build_fraction(const nr::pe::Session::State& st, char* text, size_t n) {
+    float f = 0.02f;
+    const char* what = "starting";
+    switch (st.stage) {
+        case 1: f = 0.05f; what = "planning"; break;
+        case 2: f = 0.20f; what = "reading the weights"; break;
+        case 3: f = 0.35f; what = "uploading the weights"; break;
+        case 4: f = 0.40f + 0.55f * (st.pipes_total ? float(st.pipes_done) / float(st.pipes_total) : 0.0f);
+                what = "creating pipelines"; break;
+        case 5: f = 0.97f; what = "finishing"; break;
+        default: break;
+    }
+    if (st.stage == 4) std::snprintf(text, n, "%s %u/%u, %.0f s", what, st.pipes_done, st.pipes_total, st.building_seconds);
+    else std::snprintf(text, n, "%s, %.0f s", what, st.building_seconds);
+    return f;
+}
+
+// The top of the add-on page: which network runs, what it costs, and a build in progress.
+void draw_state() {
+    const nr::pe::Session::State st = session ? session->state() : nr::pe::Session::State{};
+    char line[256];
+    if (st.running) {
+        const char* kind = st.running_int4 >= 0 ? network_name(st.running_int4) : "DEFAULT";
+        ImGui::Text("Network: %s   model %ux%u", kind, st.model_w, st.model_h);
+    } else {
+        ImGui::TextUnformatted("Network: none (frames pass through)");
+    }
+    // The network itself, then this route's own work around it (input, enlargement and composition,
+    // copies); together the whole, timed as before.
+    const float ms = session ? session->gpu_ms() : 0.0f;
+    const float net = session ? session->network_ms() : 0.0f;
+    if (ms > 0.0f && net > 0.0f) {
+        ImGui::Text("NR cost: %.2f ms/frame", net);
+        ImGui::Text("ReShade route: %.2f ms/frame   (total %.2f ms)", std::max(ms - net, 0.0f), ms);
+    } else if (ms > 0.0f) {
+        ImGui::Text("NR cost: %.2f ms/frame", ms);
+    } else {
+        ImGui::TextUnformatted("NR cost: --");
+    }
+    if (st.building) {
+        char phase[128];
+        const float f = build_fraction(st, phase, sizeof phase);
+        std::snprintf(line, sizeof line, "Building %s network", st.building_int4 >= 0 ? network_name(st.building_int4) : "the");
+        ImGui::TextUnformatted(line);
+        ImGui::ProgressBar(f, ImVec2(-1.0f, 0.0f), phase);
+    }
+    if (!last_status.empty() && !st.running) ImGui::TextUnformatted(last_status.c_str());
+    ImGui::Separator();
+}
+
 void draw_overlay(effect_runtime*) {
     std::lock_guard<std::mutex> guard(lock);
     auto& c = config.controls;
     bool changed = false;
+
+    draw_state();
 
     changed |= ImGui::Checkbox("Enable Neural Rendering", &c.enabled);
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Enable NR processing.");
@@ -848,6 +1015,18 @@ void draw_overlay(effect_runtime*) {
             changed = true;
         }
         help_marker("50% halves width and height. 100% uses the full input size.");
+        // Below 100%: how the model's result is enlarged to the frame (nr::kEnlarge*). Per frame, nothing rebuilds.
+        static const char* const transfers[] = {"Matched residual", "Edge-aware lighting + colour", "Classic"};
+        changed |= ImGui::Combo("Enlargement", &c.transfer, transfers, 3);
+        help_marker("Below 100% model resolution: how the model's result is enlarged to the frame.\n"
+                    "Matched residual (default): the model's change, enlarged, added to the full-size frame.\n"
+                    "Edge-aware lighting + colour: the change in light and in colour enlarged separately,\n"
+                    "weighted by the full-size frame's edges, then applied to the full-size frame.\n"
+                    "Classic: the model's picture enlarged with the scaler below.");
+        if (c.transfer == nr::kEnlargeClassic) {
+            static const char* const scalers[] = {"Bilinear", "Catmull-Rom", "Lanczos3", "FSR 1"};
+            changed |= ImGui::Combo("Classic scaler", &c.classic_scaler, scalers, 4);
+        }
     }
 
     {   // Model passes
@@ -923,6 +1102,7 @@ void draw_overlay(effect_runtime*) {
     changed |= deferred_slider("History (previous frame blend)", config.history, config.history, 0.0f, 1.0f, 1.0f, false, nullptr);
 
     // This project's own: [Preprocess]. Off is the upstream behaviour.
+
     if (ImGui::TreeNodeEx("Preprocess", 0)) {
         auto& p = config.preprocess.values;
         changed |= ImGui::Checkbox("Enable preprocess", &p.enabled);
@@ -973,10 +1153,6 @@ void draw_overlay(effect_runtime*) {
     // The cost, the way OptiScaler's overlay reports its own: the GPU's own
     // timestamps around the work, so it is what the pass adds to the frame and
     // not what the call took on the CPU. Dashes until the first pair is back.
-    const float ms = session ? session->gpu_ms() : 0.0f;
-    if (ms > 0.0f) std::snprintf(line, sizeof line, "GPU cost: %.2f ms/frame", ms);
-    else std::snprintf(line, sizeof line, "GPU cost: --");
-    ImGui::TextUnformatted(line);
     if (!last_status.empty()) ImGui::TextUnformatted(last_status.c_str());
 }
 
@@ -984,6 +1160,34 @@ void draw_overlay(effect_runtime*) {
 // ReShade on the finished picture, so nothing processes it.
 void on_reshade_overlay(effect_runtime*) {
     std::lock_guard<std::mutex> guard(lock);
+    // After an int4 mixed switch (hotkey, menu or ini): the build's progress, then the running network for 3 s.
+    if (session) {
+        static int seen_want = -2, seen_running = -2;
+        static std::chrono::steady_clock::time_point show_until{};
+        const nr::pe::Session::State st = session->state();
+        const auto now = std::chrono::steady_clock::now();
+        if (st.want_int4 >= 0 && (st.want_int4 != seen_want || (st.running && st.running_int4 != seen_running))) {
+            if (seen_want != -2 && seen_running >= 0) show_until = now + std::chrono::seconds(3);
+            seen_want = st.want_int4;
+            if (st.running) seen_running = st.running_int4;
+        }
+        const bool switching = st.building && st.building_int4 >= 0 && st.running && st.building_int4 != st.running_int4;
+        if (switching || now < show_until) {
+            ImGui::SetNextWindowPos(ImVec2(24.0f, 64.0f));
+            ImGui::SetNextWindowBgAlpha(0.65f);
+            ImGui::Begin("##nr-int4", nullptr,
+                         ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize |
+                             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
+            if (switching) {
+                char phase[128];
+                const float f = build_fraction(st, phase, sizeof phase);
+                ImGui::Text("NR: switching to %s ... %.0f%%", network_name(st.building_int4), f * 100.0f);
+            } else {
+                ImGui::Text("NR: %s", st.running ? network_name(st.running_int4) : "off");
+            }
+            ImGui::End();
+        }
+    }
     if (prep_switch.since_switch() > 2.0) return;
     ImGui::SetNextWindowPos(ImVec2(24.0f, 24.0f));
     ImGui::SetNextWindowBgAlpha(0.65f);
@@ -1029,6 +1233,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         if (!folder.empty()) {
             config_path = folder + "\\dlssnr-amd.ini";
             config.load(config_path);
+            // [Network] ACO Mode: decided before any device of ours (or a game's we add features to) is made.
+            nr::pe::configure_network(folder);
             log("[nr] settings file %s: enabled=%d intensity=%.2f history=%.2f", config_path.c_str(),
                 int(config.controls.enabled), config.controls.intensity, config.history);
         }
@@ -1048,6 +1254,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
             }
         }
         reshade::register_event<reshade::addon_event::init_device>(on_init_device);
+        reshade::register_event<reshade::addon_event::create_swapchain>(on_create_swapchain);
         reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
         reshade::register_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_effect_runtime);
@@ -1072,6 +1279,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         SetUnhandledExceptionFilter(previous_filter);
         nr::pe::remove_crash_watch();
         reshade::unregister_event<reshade::addon_event::init_device>(on_init_device);
+        reshade::unregister_event<reshade::addon_event::create_swapchain>(on_create_swapchain);
         reshade::unregister_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
         reshade::unregister_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
         reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_effect_runtime);

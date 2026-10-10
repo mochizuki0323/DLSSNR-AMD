@@ -1,11 +1,12 @@
 #version 460
 // The model's answer onto the frame: the composition OptiScaler DLSS-NR's
 // resolve performs (OptiScaler-DLSSNR-PreSR-Multipass, shaders/dlssnr/
-// precompile/dlssnr.hlsl, mode 1) at its default settings - Transfer 1
-// (matched residual when the model ran smaller than the frame), reversible
+// precompile/dlssnr.hlsl, mode 1) at its default settings - reversible
 // mode 0, no skin/environment split, no compare view - written for this
 // runtime. The controls are its Detail strength, Colour strength and
-// Highlight guard.
+// Highlight guard. Below 100% Model resolution its Transfer (Enlargement):
+// matched residual (the default), edge-aware lighting + colour (see
+// lighting()) and classic (with a choice of scaler, runtime_upscale.comp).
 //
 // An SDR frame is composed in its own encoded values, as OptiScaler does
 // (Passthrough); a linear-light frame is divided by the white point, composed,
@@ -15,7 +16,17 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0, rgba32f) uniform image2D result;       // the model's answer, model-sized
 layout(set = 0, binding = 1) uniform sampler2D shown;               // what the first pass was shown, model-sized
 layout(set = 0, binding = 2) uniform sampler2D keep;                // the frame, frame-sized
+#ifdef NR_STORE_NATIVE
+// runtime_transfer_store.spv: the answer goes into the frame's own format (no format declared, a
+// format with STORAGE_WRITE_WITHOUT_FORMAT), and for an 8-bit frame with runtime_alpha.comp's rounding.
+// `keep` is that same image, read and written at this pixel only.
+layout(set = 0, binding = 3) uniform writeonly image2D result_full;
+#else
 layout(set = 0, binding = 3, rgba32f) uniform image2D result_full;  // the answer, frame-sized
+#endif
+// Transfer = classic with a scaler other than bilinear: `result` and `shown` enlarged by runtime_upscale.comp.
+layout(set = 0, binding = 4, rgba32f) uniform readonly image2D up_result;
+layout(set = 0, binding = 5, rgba32f) uniform readonly image2D up_shown;
 layout(push_constant) uniform Push {
     uint width, height;       // the frame
     uint model_w, model_h;    // `result` and `shown`
@@ -24,7 +35,22 @@ layout(push_constant) uniform Push {
     float colour;             // Colour strength, 0..4
     float max_ratio;          // Highlight guard, 1..8
     float white;              // linear light's white point
+    uint mode;                // below the frame's extent: 0 classic, 1 matched residual, 2 lighting + colour
+    uint flags;               // kEnlarged, kGuided
+    float sigma;              // lighting + colour, guided: range kernel width in stops
 } pc;
+const uint kEnlarged = 1u;    // classic: read up_result
+const uint kGuided = 2u;      // lighting + colour: edge-aware weights from the full-resolution proxy
+#ifdef NR_STORE_NATIVE
+const uint kRoundU8 = 4u;     // an 8-bit frame: round to k/255 as runtime_alpha.comp
+// runtime_alpha.comp's rounding. A function of its own, so `precise` covers these two operations
+// and not, through `rgb`, the whole composition (which runtime_transfer.spv leaves contractible).
+vec3 round_u8(vec3 rgb) {
+    precise vec3 scaled = clamp(rgb, vec3(0), vec3(1)) * 255.0;
+    precise vec3 shifted = scaled + 0.5;
+    return floor(shifted) / 255.0;
+}
+#endif
 
 const vec3 kLuma = vec3(0.2126, 0.7152, 0.0722);
 
@@ -42,6 +68,9 @@ vec3 srgb_to_linear(vec3 v) {
 vec3 soft_knee(vec3 display) {
     const float l = dot(display, kLuma);
     if (l > 0.75) display *= (0.75 + 0.25 * (1.0 - exp(-(l - 0.75) / 0.25))) / l;
+    // runtime_encode.comp's peak scalar, so the full-size proxy is what the model was shown
+    const float peak = max(display.r, max(display.g, display.b));
+    if (peak > 1.0) display /= peak;
     return display;
 }
 
@@ -142,6 +171,55 @@ void model_pair(ivec2 xy, out vec3 m, out vec3 s) {
       + w.z * texelFetch(shown, ivec2(i0.x, i1.y), 0).rgb + w.w * texelFetch(shown, i1, 0).rgb;
 }
 
+// Edge-aware lighting + colour (the idea of carrying the change as lighting and colour is OptiScaler-NR's
+// "Lighting + colour", from its author's Display Filter). The model's change is measured at the model's
+// extent as a lighting gain (log2 luminance ratio) and a chromaticity change (luminance-normalised RGB),
+// enlarged, and applied to the full-resolution proxy `P`. With kGuided each of the 4x4 model texels is
+// weighted by how close its input luminance is to the pixel's (joint bilateral upsampling guided by P),
+// with plain spatial weights as the fallback. Near black the additive residual is used instead.
+const float kEps = 1.0 / 256.0;
+vec3 comp(vec3 v) { return pc.passthrough != 0u ? v : srgb_to_linear(v); }
+
+vec3 lighting(ivec2 xy, vec3 P) {
+    const bool guided = (pc.flags & kGuided) != 0u;
+    const int r = guided ? 2 : 1;
+    const vec2 p = (vec2(xy) + 0.5) * (vec2(pc.model_w, pc.model_h) / vec2(pc.width, pc.height)) - 0.5;
+    const ivec2 base = ivec2(floor(p));
+    const vec2 f = p - vec2(base);
+    const ivec2 hi = ivec2(pc.model_w, pc.model_h) - 1;
+    const float yp = dot(P, kLuma);
+    const float lp = log2(yp + kEps);
+    const float inv2s2 = 1.0 / (2.0 * max(pc.sigma * pc.sigma, 1e-6));
+    float wg = 0.0, ws_sum = 0.0, g_g = 0.0, g_s = 0.0;
+    vec3 c_g = vec3(0.0), c_s = vec3(0.0), r_g = vec3(0.0), r_s = vec3(0.0);
+    for (int j = 1 - r; j <= r; ++j) {
+        for (int i = 1 - r; i <= r; ++i) {
+            const ivec2 q = clamp(base + ivec2(i, j), ivec2(0), hi);
+            const vec3 m = comp(imageLoad(result, q).rgb), s = comp(texelFetch(shown, q, 0).rgb);
+            const float ym = dot(m, kLuma), ys = dot(s, kLuma);
+            const float g = log2((ym + kEps) / (ys + kEps));
+            const vec3 dc = m / (ym + kEps) - s / (ys + kEps);
+            const vec3 res = m - s;
+            const vec2 d = abs(vec2(i, j) - f);
+            // plain: bilinear; guided: a Gaussian of 0.6 model texels over the 4x4, as local as bilinear
+            const float ws = guided ? exp(-dot(d, d) * (1.0 / (2.0 * 0.36)))
+                                    : max(0.0, 1.0 - d.x) * max(0.0, 1.0 - d.y);
+            const float dl = lp - log2(ys + kEps);
+            const float w = guided ? ws * exp(-dl * dl * inv2s2) : ws;
+            g_g += w * g; c_g += w * dc; r_g += w * res; wg += w;
+            g_s += ws * g; c_s += ws * dc; r_s += ws * res; ws_sum += ws;
+        }
+    }
+    float G; vec3 DC, RES;
+    if (wg > 1e-4 * ws_sum) { G = g_g / wg; DC = c_g / wg; RES = r_g / wg; }
+    else { G = g_s / ws_sum; DC = c_s / ws_sum; RES = r_s / ws_sum; }
+    // c = rgb / (Y + eps) for every picture, so P = c_P (Y_P + eps) and the rebuilt answer is
+    // (c_P + DC)(Y_P + eps) 2^G: P itself when nothing changed, the model's answer where P is what it saw.
+    const vec3 rebuilt = max(P + DC * (yp + kEps), vec3(0.0)) * exp2(G);
+    const vec3 added = P + RES;
+    return mix(added, rebuilt, smoothstep(kEps, 8.0 * kEps, yp));
+}
+
 void main() {
     const ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
     if (xy.x >= int(pc.width) || xy.y >= int(pc.height)) return;
@@ -157,23 +235,40 @@ void main() {
     const float original_luma = dot(original, kLuma);
     float proxy_luma = dot(proxy, kLuma);
 
-    // Matched residual: below the frame's extent, the edit rides on the
-    // frame's own proxy instead of the model's smaller picture.
+    // Below the frame's extent: mode 1 matched residual (the edit added to the frame's own proxy),
+    // 2 edge-aware (see lighting()), 0 classic (the enlarged model picture, below).
     if (pc.model_w != pc.width || pc.model_h != pc.height) {
-        const vec3 edit = model - proxy;
-        const vec3 full = pass_through ? clamp(original, 0.0, 1.0) : clamp(soft_knee(original), 0.0, 1.0);
-        proxy = full;
-        proxy_luma = dot(proxy, kLuma);
-        model = cube_scale_residual(full, full + edit);
+        if (pc.mode == 1u) {
+            const vec3 edit = model - proxy;
+            const vec3 full = pass_through ? clamp(original, 0.0, 1.0) : clamp(soft_knee(original), 0.0, 1.0);
+            proxy = full;
+            proxy_luma = dot(proxy, kLuma);
+            model = cube_scale_residual(full, full + edit);
+        } else if (pc.mode == 2u) {
+            const vec3 full = pass_through ? clamp(original, 0.0, 1.0) : clamp(soft_knee(original), 0.0, 1.0);
+            const vec3 target = lighting(xy, full);
+            proxy = full;
+            proxy_luma = dot(proxy, kLuma);
+            model = cube_scale_residual(full, target);
+        } else if ((pc.flags & kEnlarged) != 0u) {
+            model = comp(imageLoad(up_result, xy).rgb);
+        }
     }
 
     // The model's answer is a picture in its own right, rescaled to sit where
     // the frame's luminance says; above what the proxy could show, the frame's
     // headroom is carried on top.
     const float model_luma = dot(model, kLuma);
+    // Classic: the enlarged model picture is the result; the frame adds only the light above the proxy's
+    // knee (linear input).
+    const bool classic = pc.mode == 0u && (pc.model_w != pc.width || pc.model_h != pc.height);
     vec3 upgraded;
     if (model_luma <= 1e-5) {
         upgraded = original;
+    } else if (classic) {
+        const vec3 full = pass_through ? clamp(original, 0.0, 1.0) : clamp(soft_knee(original), 0.0, 1.0);
+        const float headroom = max(0.0, original_luma - dot(full, kLuma));
+        upgraded = mix(original, model * ((model_luma + headroom) / model_luma), clamp(pc.detail, 0.0, 1.0));
     } else {
         const float ratio = original_luma < proxy_luma
             ? original_luma / max(proxy_luma, 1e-6)
@@ -196,5 +291,11 @@ void main() {
     if (pc.colour > 1.0)
         answer = clamp_ap1(from_oklab(vec3(1.0, pc.colour, pc.colour) * to_oklab(max(answer, vec3(0.0)))));
 
+#ifdef NR_STORE_NATIVE
+    vec3 rgb = max(answer * norm, vec3(0.0));
+    if ((pc.flags & kRoundU8) != 0u) rgb = round_u8(rgb);
+    imageStore(result_full, xy, vec4(rgb, original_s.a));
+#else
     imageStore(result_full, xy, vec4(max(answer * norm, vec3(0.0)), original_s.a));
+#endif
 }

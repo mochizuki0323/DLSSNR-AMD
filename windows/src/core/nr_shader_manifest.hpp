@@ -29,7 +29,7 @@ inline std::map<std::string, uint32_t> read_shader_manifest(std::istream& input)
         }
         first = false;
         if (key != "vattn_qt" && key != "gemm_wide_mt" &&
-            key != "gemm_wide_nt" && key != "weight_layout" && key != "math_profile" && key != "qkv_fused_norm" && key != "ups_fused_mode" && key != "wide_ups_fused_mode" && key != "gemm_proj_mt" && key != "gemm_proj_nt" && key != "gemm_projw_mt" && key != "gemm_projw_nt" && key != "ffwd_wgw" && key != "ffwd_gmajor" && key != "gemm_remap" && key != "upsview_vec" && key != "repack_vec" && key != "wide_ups_mask" && key != "persist_df" && key != "ds_fuse" && key != "decups_vec" && key != "persist_ds" && key != "persist_up" && key != "persist_strag" && key != "persist_one" && key != "noise_field" && key != "ffwd_fm2_min" && key != "post_alpha")
+            key != "gemm_wide_nt" && key != "weight_layout" && key != "math_profile" && key != "qkv_fused_norm" && key != "ups_fused_mode" && key != "wide_ups_fused_mode" && key != "gemm_proj_mt" && key != "gemm_proj_nt" && key != "gemm_projw_mt" && key != "gemm_projw_nt" && key != "ffwd_wgw" && key != "ffwd_gmajor" && key != "gemm_remap" && key != "upsview_vec" && key != "repack_vec" && key != "wide_ups_mask" && key != "persist_df" && key != "ds_fuse" && key != "decups_vec" && key != "persist_ds" && key != "persist_up" && key != "persist_strag" && key != "persist_one" && key != "noise_field" && key != "ffwd_fm2_min" && key != "post_alpha" && key != "tchain")
             throw std::runtime_error("unknown shader manifest key: " + key);
         uint64_t number = 0;
         const auto result = std::from_chars(token.data(), token.data() + token.size(), number);

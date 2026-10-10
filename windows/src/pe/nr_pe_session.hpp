@@ -106,9 +106,40 @@ class Session {
     // the network's cost tracks the resolution it runs at. Engine motion vectors
     // still come from the same call, at render resolution; the shader samples
     // them by normalized coordinate, so the resolutions need not match.
+    // `input` (optional): read the colour from there and write the answer into
+    // `output`, which then needs no seed copy of it. Returns false without
+    // recording anything when that is not possible (the caller seeds and runs in
+    // place instead): different formats or extents, or the model not applied.
     bool run_after(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                    ID3D12Resource* output, D3D12_RESOURCE_STATES output_state,
-                   const EngineResources& resources, const Controls& controls);
+                   const EngineResources& resources, const Controls& controls,
+                   ID3D12Resource* input = nullptr, D3D12_RESOURCE_STATES input_state = D3D12_RESOURCE_STATE_COMMON);
+
+    // Is this D3D12 device the native runtime (the network then runs on a Vulkan device of its own,
+    // nr_pe_bridge.hpp) rather than vkd3d-proton? Decided on the first device seen; NR_BRIDGE=1 takes
+    // the bridge under vkd3d-proton too.
+    bool bridged(ID3D12Device* device);
+
+    // A D3D12 frame handed over at queue level rather than inside a command list: the ReShade route,
+    // whose effect list is ReShade's own immediate list and can be flushed. In place on `target`.
+    // Only for a bridged device.
+    struct D3D12QueueFrame {
+        ID3D12Device* device{};
+        ID3D12CommandQueue* queue{};
+        // Hands everything recorded so far to `queue` (ReShade: flush_immediate_command_list).
+        std::function<void()> flush;
+        ID3D12Resource* target{};
+        D3D12_RESOURCE_STATES target_state{D3D12_RESOURCE_STATE_RENDER_TARGET};
+        ID3D12Resource* motion{};
+        D3D12_RESOURCE_STATES motion_state{D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};
+        ID3D12Resource* depth{};
+        D3D12_RESOURCE_STATES depth_state{D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};
+        bool depth_inverted{true};
+        float motion_scale_x{1.0f}, motion_scale_y{1.0f};
+        bool reset{};
+        bool linear_hdr{};   // as D3D11Frame::linear_hdr
+    };
+    bool run_d3d12_queue(const D3D12QueueFrame& frame, const Controls& controls);
 
     // D3D11, through DXVK. There is no command list to record into, so this one
     // owns a command buffer, records into it, and submits it on DXVK's own queue
@@ -145,6 +176,9 @@ class Session {
         bool linear_hdr{};
     };
     bool run_d3d11(const D3D11Frame& frame, const Controls& controls);
+    // The same for a D3D10 game on the native runtime (`device` an ID3D10Device), through the bridge
+    // with keyed mutexes; D3D10 has neither fences nor compute shaders, so depth is not read.
+    bool run_d3d10(const D3D11Frame& frame, const Controls& controls);
 
     // The fallback: no upscaler, so no engine data. The colour is the finished
     // back buffer - already upscaled, already carrying the game's UI - and the
@@ -178,6 +212,15 @@ class Session {
         bool reset{};
         bool upscaler_input{};   // as D3D11Frame::upscaler_input
         bool linear_hdr{};       // as D3D11Frame::linear_hdr
+        // The caller's output (optional): the network reads `colour` in place and writes
+        // here, and run_vulkan returns it - no copy into an image of ours and back.
+        // `output_usage` / `colour_usage` as far as the caller's descriptors say.
+        VkImage output{}; VkImageLayout output_layout{VK_IMAGE_LAYOUT_GENERAL};
+        VkImageUsageFlags output_usage{}, colour_usage{};
+        // The answer back into `colour` itself (copied out and back by the runtime, so `colour`
+        // needs transfer source and destination usage, and is left in colour_layout); run_vulkan
+        // then returns `colour`. Otherwise the answer is in an image of ours.
+        bool in_place{};
     };
     // A Vulkan game's own queue. The two D3D runtimes have an interop object to
     // ask for one; a Vulkan game has nothing of the sort, so the queue is learned
@@ -186,7 +229,8 @@ class Session {
     void set_vulkan_queue(VkQueue queue, uint32_t family);
 
     // Returns the image to hand the upscaler in place of the game's colour, or
-    // null when the pass could not run.
+    // null when the pass could not run. With VulkanFrame::output set it is that
+    // image when the answer went straight into it.
     VkImage run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
                        const VulkanFrame& frame, const Controls& controls);
     // The universal fallback: the frame exactly as it is about to be shown, in
@@ -255,6 +299,25 @@ class Session {
     // around the work, not a clock around the call. Smoothed; zero until the
     // first result is back, and zero on a queue with no timestamp support.
     float gpu_ms() const;
+    // The network's part of gpu_ms (every pass); gpu_ms - network_ms is the route's own work.
+    float network_ms() const;
+
+    // What a host's UI shows: the network running and the one being built.
+    struct State {
+        bool running = false;           // a network is serving frames
+        int running_int4 = -1;          // 1 int4 mixed, 0 the default network, -1 none (or no int4 in this build)
+        uint32_t model_w = 0, model_h = 0;
+        int want_int4 = -1;             // [Int4Mixed]: what the switch asks for; -1 no int4 in this build
+        bool int4_available = false;    // int4 mixed can be switched to in this run
+        bool building = false;
+        int building_int4 = -1;
+        float building_seconds = 0.0f;
+        int stage = 0;                  // nr::g_build_stage while building
+        uint32_t pipes_done = 0, pipes_total = 0;
+    };
+    State state() const;
+    // [Int4Mixed] from the host's UI, as the hotkey does (the caller saves Enabled to the ini).
+    void set_int4(bool on);
 
     // The largest device-local heap as the driver's memory budget sees it, this
     // process's use against its budget, in MB; "" before a device is known. For

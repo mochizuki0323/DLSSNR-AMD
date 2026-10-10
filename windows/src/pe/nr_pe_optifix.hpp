@@ -1,8 +1,9 @@
 #pragma once
-// In-memory fixes for OptiScaler-NR v0.8.4, applied from this module's DllMain - OptiScaler loads it
-// during its own initialisation, before the game creates a Vulkan device or presents. OptiScaler's
-// file on disk is not touched, and each fix is found by exact byte signatures: any other build is
-// left alone and the log says so. NR_OPTISCALER_FIX=0 turns them all off.
+// In-memory fixes for OptiScaler-NR v0.8.4 and v0.8.91, applied from this module's DllMain -
+// OptiScaler loads it during its own initialisation, before the game creates a Vulkan device or
+// presents. OptiScaler's file on disk is not touched, and each fix is found by exact byte signatures
+// (v0.8.91 matches the v0.8.4 ones for fixes 1, 3, 4 and has its own for 2, 5 and 7): any other build
+// is left alone and the log says so. NR_OPTISCALER_FIX=0 turns them all off.
 //
 // 2. Finished Picture on DXVK/vkd3d-proton: see fix_finished_picture in nr_pe_optifix.cpp.
 // 3. A 0 x 0 (window-sized) swapchain taken for an overlay and never wrapped (Helldivers 2): see

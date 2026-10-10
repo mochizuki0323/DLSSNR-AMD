@@ -14,7 +14,7 @@ bit-identical. The weights are read from the user's own DLL at install time
 
 ## Routes into a game
 
-The network is Vulkan compute, so it has to run on a Vulkan device, and it runs on the **game's own**
+The network is Vulkan compute, so it has to run on a Vulkan device. On Linux it runs on the **game's own**
 one: its passes are recorded into the game's command stream, between the game's work and the frame's
 presentation, with no second device, no copy between APIs and no cross-API synchronisation. Every
 route below is a way of getting from a game's graphics API to that Vulkan device and to the frame's
@@ -61,15 +61,35 @@ the add-on gets a real `VkDevice`. That needs three pieces of plumbing:
 
 Native Vulkan games use the same route: ReShade as a layer under the game's own Vulkan device.
 
-**Windows.** A native D3D game on Windows has no Vulkan device underneath it, and running the network
-on a separate device would mean sharing or copying the frame between two APIs every frame. So the
-Windows package puts DXVK and vkd3d-proton (from GE-Proton) into the game folder and the game runs on
-Vulkan there too. That is why the Windows version is limited: DX11 games cannot use the OptiScaler route (OptiScaler hands DX11
-frames to the system's D3D12, which cannot share DXVK's images on Windows), overlays conflict, and the
-driver presents through DXGI, which needs a small `dxgi` splitter DLL.
+**Windows.** A native D3D game on Windows has no Vulkan device underneath it. DirectX 10/11/12 games
+keep the system's D3D, and the network runs on a Vulkan device of its own, created on the adapter the
+game renders with (matched by LUID; `windows/src/pe/nr_pe_bridge.hpp`). The frame crosses over in D3D
+textures created as shared and imported into Vulkan, and the two sides are ordered on the GPU by a
+shared D3D fence imported as a Vulkan timeline semaphore:
+
+- D3D12, OptiScaler route: the evaluate call sits in the middle of the game's command list. The list
+  is cut there (`nr_pe_d3d12split.cpp`): ExecuteCommandLists submits the part before it, the copies into
+  the shared textures and a fence signal; the network runs on the Vulkan queue after that value and
+  signals the next; the rest of the list runs after it, with the state it had at the cut replayed.
+  A list the cut cannot follow (open queries or render passes, predication, bundles it has not seen)
+  runs whole, without NR, for that frame.
+- D3D12 and D3D11 in the ReShade route, D3D11 in the OptiScaler route: the work is ordered on the
+  queue (D3D12) or on the immediate context through `ID3D11DeviceContext4` and a shared `ID3D11Fence`.
+  OptiScaler runs the upscaler of DX11 games on a D3D12 device of its own (the installer sets
+  `Dx11Upscaler=ffx_12`), and NR runs there.
+- D3D10 has no fences: its shared textures carry a keyed mutex. Depth is not handed over yet: the D3D11
+  path converts it with a compute shader, which D3D10 does not have, and a pixel-shader copy is not
+  implemented.
+
+D3D9 shares neither textures nor fences, so DX9 games run on DXVK with ReShade as a Vulkan layer
+underneath it, as on Linux.
 
 The Windows version runs the same network through AMD's Windows shader compiler, which produces slower
-code for the largest kernels than Mesa's ACO does on Linux.
+code for the largest kernels than Mesa's ACO does on Linux. With `[Network] ACO Mode = 1` it imports
+machine code made by ACO for the Linux shaders instead (`windows/data/aco/records`), through
+`VK_KHR_pipeline_binary`: the driver compiles a shader with the same interface to get its pipeline
+container, ACO's code is put into that container (`windows/src/core/nr_pal_binary.hpp`,
+`nr_pipeline_binary.hpp`), and the imported binaries are kept in `dlssnr-amd\aco-cache`.
 
 ## Why Vulkan and not HIP/ROCm
 
@@ -104,6 +124,7 @@ linux/                 the Linux version (the reference implementation)
   package/               installer, README and model-tools/ (model extraction)
   vulkan-loader/         patches for the Khronos loader used by the vulkan/dx9 routes
 windows/               a separate copy for the AMD Windows driver, changed on its own
+  data/aco/              ACO machine code of the Linux network, for [Network] ACO Mode = 1
 fetch_deps.sh          pinned third-party downloads
 ```
 

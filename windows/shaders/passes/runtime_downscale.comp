@@ -1,0 +1,137 @@
+#version 460
+// Model resolution: the frame filtered down to the model's extent, read in its own format. It
+// replaces a blit of the frame into an RGBA32F copy followed by a linear blit of that copy, and gives
+// what that linear blit gives, bit for bit:
+//  - where it samples: `taps` holds, per model column and then per model row, the first texel and the
+//    fraction the blit itself uses (measured from a probe blit when the runtime is built; the
+//    fractions are multiples of 1/256);
+//  - what it computes: the texture unit's filtering of an RGBA32F texel quad (RDNA4), as measured
+//    (4.2M random quads per case, every one equal): the texels with a
+//    nonzero weight set the exponent E of the largest; each texel is truncated toward zero to a
+//    multiple of 2^(E-25); the sum weighted by the 16-bit weights (qx, 256-qx) x (qy, 256-qy) is exact;
+//    it is floored to 35 significant bits, rounded to nearest even at 29 bits and then at 24; a zero
+//    sum is +0. All the weight on one texel (both fractions 0) gives that texel bit for bit (-0 too).
+// texelFetch converts every format exactly (UNORM, FP16, 11/11/10), as the blit into RGBA32F did.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(std430, set = 0, binding = 0) readonly buffer Taps { vec2 taps[]; };   // [0, mw) columns, [mw, mw + mh) rows
+layout(set = 0, binding = 1) uniform sampler2D frame;
+layout(set = 0, binding = 2, rgba32f) uniform writeonly image2D model_in;
+layout(push_constant) uniform Push { uint mw, mh; } pc;
+
+// 64-bit two's complement integers as (hi, lo).
+uvec2 add64(uvec2 a, uvec2 b) { uint c; const uint lo = uaddCarry(a.y, b.y, c); return uvec2(a.x + b.x + c, lo); }
+uvec2 neg64(uvec2 a) { return add64(uvec2(~a.x, ~a.y), uvec2(0u, 1u)); }
+uvec2 shr64(uvec2 a, int n) {   // logical, 0 < n < 32
+    return uvec2(a.x >> uint(n), (a.y >> uint(n)) | (a.x << uint(32 - n)));
+}
+uvec2 shl64(uvec2 a, int n) {   // 0 < n < 32
+    return uvec2((a.x << uint(n)) | (a.y >> uint(32 - n)), a.y << uint(n));
+}
+int bits64(uvec2 a) { return a.x != 0u ? findMSB(a.x) + 33 : findMSB(a.y) + 1; }   // significant bits of a magnitude
+// a magnitude rounded to nearest even at `keep` significant bits (it may carry into one more bit)
+uvec2 round_bits(uvec2 a, int keep) {
+    const int n = bits64(a) - keep;
+    if (n <= 0) return a;
+    const uvec2 low_mask = n >= 32 ? uvec2((1u << uint(n - 32)) - 1u, 0xffffffffu) : uvec2(0u, (1u << uint(n)) - 1u);
+    const uvec2 low = uvec2(a.x & low_mask.x, a.y & low_mask.y);
+    const uvec2 half_ = n > 32 ? uvec2(1u << uint(n - 33), 0u) : n == 32 ? uvec2(0u, 0x80000000u) : uvec2(0u, 1u << uint(n - 1));
+    uvec2 r = uvec2(a.x & ~low_mask.x, a.y & ~low_mask.y);
+    const uvec2 unit = n >= 32 ? uvec2(1u << uint(n - 32), 0u) : uvec2(0u, 1u << uint(n));
+    const bool above = low.x > half_.x || (low.x == half_.x && low.y > half_.y);
+    const bool tie = low == half_;
+    const bool odd = (r.x & unit.x) != 0u || (r.y & unit.y) != 0u;
+    if (above || (tie && odd)) r = add64(r, unit);
+    return r;
+}
+
+// The same at fractions 0.5 on both axes (an exact 2:1 downscale, every weight 1/4), in 32 bits: the
+// aligned texels sum to under 2^27, so the 35- and 29-bit steps change nothing and the conversion
+// to float is the rounding at 24 bits.
+float filter_half(const float v[4]) {
+    int emax = -1000;
+    for (int i = 0; i < 4; ++i)
+        if (v[i] != 0.0) { int e; frexp(v[i], e); emax = max(emax, e); }
+    if (emax == -1000) return 0.0;
+    int sum = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (v[i] == 0.0) continue;
+        int e; frexp(v[i], e);
+        const int m = int(ldexp(abs(v[i]), 24 - e));
+        const int sh = emax - e - 1;
+        const int t = sh < 0 ? m << 1 : (sh >= 31 ? 0 : m >> sh);
+        sum += v[i] < 0.0 ? -t : t;
+    }
+    return ldexp(float(sum), emax - 27);   // units of 2^(emax-25), and the quarter
+}
+
+float filter_channel(const float v[4], const uint w[4]) {
+    // E from the texels that carry weight
+    int emax = -1000;
+    for (int i = 0; i < 4; ++i)
+        if (w[i] != 0u && v[i] != 0.0) { int e; frexp(v[i], e); emax = max(emax, e); }
+    if (emax == -1000) return 0.0;
+    uvec2 pos = uvec2(0u), neg = uvec2(0u);
+    for (int i = 0; i < 4; ++i) {
+        if (w[i] == 0u || v[i] == 0.0) continue;
+        int e; frexp(v[i], e);
+        const int sh = emax - e - 1;                                  // 24-bit significand -> 2^(emax-25) units
+        const uint m = uint(ldexp(abs(v[i]), 24 - e));                // the significand, exact
+        const uint t = sh < 0 ? m << 1u : (sh >= 32 ? 0u : m >> uint(sh));
+        uvec2 p; umulExtended(t, w[i], p.x, p.y);                     // < 2^41
+        if (v[i] < 0.0) neg = add64(neg, p); else pos = add64(pos, p);
+    }
+    // s = pos - neg in units of 2^(emax-25-16)
+    uvec2 s = add64(pos, neg64(neg));
+    const bool negative = (s.x & 0x80000000u) != 0u;
+    if (s == uvec2(0u)) return 0.0;
+    // floored (toward -inf) to 35 significant bits
+    {
+        const uvec2 mag = negative ? neg64(s) : s;
+        const int n = bits64(mag) - 35;
+        if (n > 0) {
+            // floor(s / 2^n) * 2^n on the two's complement value
+            uvec2 q = shr64(s, n);
+            if (negative) q.x |= ~(0xffffffffu >> uint(n));             // arithmetic shift
+            s = shl64(q, n);
+        }
+    }
+    uvec2 mag = (s.x & 0x80000000u) != 0u ? neg64(s) : s;
+    mag = round_bits(round_bits(mag, 29), 24);
+    // at most 24 significant bits now: exact as a float
+    const int b = bits64(mag);
+    float r;
+    if (b <= 24) r = float(mag.y) + (mag.x != 0u ? ldexp(float(mag.x), 32) : 0.0);
+    else { const int n = b - 24; const uvec2 top = n >= 32 ? uvec2(0u, mag.x >> uint(n - 32)) : shr64(mag, n);
+           r = ldexp(float(top.y), n); }
+    r = ldexp(r, emax - 41);
+    return negative ? -r : r;
+}
+
+void main() {
+    const ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    if (xy.x >= int(pc.mw) || xy.y >= int(pc.mh)) return;
+    const vec2 cx = taps[xy.x], cy = taps[pc.mw + uint(xy.y)];
+    const ivec2 hi = textureSize(frame, 0) - 1;
+    const int x0 = clamp(int(cx.x), 0, hi.x), x1 = clamp(int(cx.x) + 1, 0, hi.x);
+    const int y0 = clamp(int(cy.x), 0, hi.y), y1 = clamp(int(cy.x) + 1, 0, hi.y);
+    const vec4 a = texelFetch(frame, ivec2(x0, y0), 0), b = texelFetch(frame, ivec2(x1, y0), 0);
+    const vec4 c = texelFetch(frame, ivec2(x0, y1), 0), d = texelFetch(frame, ivec2(x1, y1), 0);
+    const uint qx = uint(cx.y * 256.0), qy = uint(cy.y * 256.0);
+    const uint w[4] = uint[4]((256u - qx) * (256u - qy), qx * (256u - qy), (256u - qx) * qy, qx * qy);
+    vec4 r;
+    if (qx == 0u && qy == 0u) {
+        r = a;
+    } else if (any(isnan(a)) || any(isnan(b)) || any(isnan(c)) || any(isnan(d)) ||
+        any(isinf(a)) || any(isinf(b)) || any(isinf(c)) || any(isinf(d))) {
+        // not finite: the plain interpolation (no frame format the downscale reads produces these)
+        r = mix(mix(a, b, cx.y), mix(c, d, cx.y), cy.y);
+    } else if (qx == 128u && qy == 128u) {
+        for (int ch = 0; ch < 4; ++ch) r[ch] = filter_half(float[4](a[ch], b[ch], c[ch], d[ch]));
+    } else {
+        for (int ch = 0; ch < 4; ++ch) {
+            const float v[4] = float[4](a[ch], b[ch], c[ch], d[ch]);
+            r[ch] = filter_channel(v, w);
+        }
+    }
+    imageStore(model_in, xy, r);
+}

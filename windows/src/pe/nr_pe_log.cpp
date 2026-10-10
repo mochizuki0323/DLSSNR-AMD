@@ -45,9 +45,55 @@ std::string resolve_path() {
                           : folder + "\\dlssnr-amd.log";
 }
 
+// [Log] in dlssnr-amd.ini beside this module, read once, before the first line: Enabled (0: no log
+// at all) and ClearOnStart (1: the first module of this process to log starts the file afresh).
+// Absent file, section or key: both on.
+struct LogSettings { bool enabled = true, clear = true; };
+LogSettings read_settings() {
+    LogSettings s;
+    const std::string folder = resolve_folder();
+    FILE* f = std::fopen((folder.empty() ? std::string("dlssnr-amd.ini") : folder + "\\dlssnr-amd.ini").c_str(), "r");
+    if (!f) return s;
+    auto trim = [](std::string t) {
+        const auto b = t.find_first_not_of(" \t\r\n"), e = t.find_last_not_of(" \t\r\n");
+        return b == std::string::npos ? std::string{} : t.substr(b, e - b + 1);
+    };
+    auto lower = [](std::string t) { for (char& c : t) if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a'); return t; };
+    bool in_log = false;
+    char line[512];
+    while (std::fgets(line, sizeof line, f)) {
+        std::string t = line;
+        const auto comment = t.find_first_of(";#");
+        if (comment != std::string::npos) t = t.substr(0, comment);
+        t = trim(t);
+        if (t.empty()) continue;
+        if (t.front() == '[') { in_log = lower(t) == "[log]"; continue; }
+        const auto eq = t.find('=');
+        if (!in_log || eq == std::string::npos) continue;
+        const std::string key = lower(trim(t.substr(0, eq))), v = lower(trim(t.substr(eq + 1)));
+        const bool on = v == "1" || v == "true" || v == "on" || v == "yes";
+        const bool off = v == "0" || v == "false" || v == "off" || v == "no";
+        if (!on && !off) continue;
+        if (key == "enabled") s.enabled = on;
+        else if (key == "clearonstart") s.clear = on;
+    }
+    std::fclose(f);
+    return s;
+}
+
+FILE* open_log() {
+    const LogSettings s = read_settings();
+    if (!s.enabled) return nullptr;
+    // Several of our modules can live in one process (the NGX forwarder and the core); only the
+    // first to log may start the file afresh, or it would erase what the other already wrote.
+    char seen[4];
+    const bool first = GetEnvironmentVariableA("NR_LOG_OPENED", seen, sizeof seen) == 0;
+    if (first) SetEnvironmentVariableA("NR_LOG_OPENED", "1");
+    return std::fopen(resolve_path().c_str(), s.clear && first ? "w" : "a");
+}
+
 FILE* file() {
-    static std::string path = resolve_path();
-    static FILE* handle = std::fopen(path.c_str(), "a");
+    static FILE* handle = open_log();
     return handle;
 }
 

@@ -8,11 +8,14 @@ fswin_t.comp rolled, so the small fragment arrays they index (qb[m], eq[m][h], .
 dynamic index and live in scratch. NIR unrolls them before ACO sees them. Doing the same
 unroll in the source gives LLPC straight-line code with constant indices.
 
-A loop is unrolled when its header is `for (int V = A; V < B; V++ | ++V | V += S)` with A, B,
-S integer constant expressions, its body neither assigns V nor contains break/continue/return
-at its own level, and the trip count is at most --max-trip. Each copy is
-`{ const int V = value; body }` and the copies sit in one more block, since the loop can be
-the unbraced body of an `if`. Inner loops are unrolled first.
+A loop is unrolled when its header is `for (int|uint V = A; V < B; V++ | ++V | V += S)` with A, B,
+S integer constant expressions (`16u` and `uint(...)` are integers too), its body neither assigns V nor
+contains break/return at its own level, and the trip count is at most --max-trip. Each copy is
+`{ const int V = value; body }`, or `{ const int V = value; do body while (false); }` when the body has a
+`continue` (which then ends its own copy), and the copies sit in one more block, since the loop can be
+the unbraced body of an `if`. Inner loops are unrolled first; in each copy, the loops left whose headers
+use V get V's value written in and are tried again. `.length()` of a 16x16 subgroup cooperative matrix
+is written as 8 everywhere (8 components a lane at the subgroup size 32 the runtime requires).
 """
 import argparse
 import re
@@ -90,7 +93,8 @@ def statement_end(s, i):
 
 
 def const_eval(e):
-    e = e.strip()
+    e = re.sub(r'\buint\s*\(', '(', e.strip())
+    e = re.sub(r'(\d)[uU]\b', r'\1', e)
     if not CONST.match(e):
         return None
     try:
@@ -100,7 +104,7 @@ def const_eval(e):
 
 
 def own_level_escape(body):
-    """break/continue/return that would leave this loop (nested loops/switches are skipped)."""
+    """The kinds of break/continue/return that would leave this loop (nested loops/switches skipped)."""
     s, i, flat = body, 0, []
     loop = re.compile(r'\b(for|while|switch|do)\b')
     while i < len(s):
@@ -112,8 +116,24 @@ def own_level_escape(body):
         try:
             i = statement_end(s, m.start())
         except Exception:
-            return True
-    return re.search(r'\b(break|continue|return)\b', ''.join(flat)) is not None
+            return {'?'}
+    return set(re.findall(r'\b(break|continue|return)\b', ''.join(flat)))
+
+
+def bind_outer(body, var, lit, max_trip, stats):
+    """`body` as one copy of an unrolled loop over `var` = `lit`: the headers of the loops still in it that
+    use `var` get the value written in, and are offered to transform() again (a copy may make them constant).
+    Untouched when no header uses `var`, or when the body declares a `var` of its own."""
+    if not re.search(r'\bfor\s*\([^;]*\b%s\b' % var, body) or re.search(r'\bu?int\s+%s\b' % var, body):
+        return body
+    pieces, at = [], 0
+    for h in HEAD.finditer(body):
+        lo = body.index('(', h.start())
+        hi = match_paren(body, lo)
+        pieces.append(body[at:lo] + re.sub(r'\b%s\b' % var, '(%s)' % lit, body[lo:hi + 1]))
+        at = hi + 1
+    pieces.append(body[at:])
+    return transform(''.join(pieces), max_trip, stats)
 
 
 def transform(s, max_trip, stats):
@@ -131,10 +151,11 @@ def transform(s, max_trip, stats):
         parts = header.split(';')
         unrolled = None
         if len(parts) == 3:
-            h0 = re.match(r'\s*int\s+(\w+)\s*=\s*(.+)$', parts[0], re.S)
+            h0 = re.match(r'\s*(int|uint)\s+(\w+)\s*=\s*(.+)$', parts[0], re.S)
             if h0:
-                v = h0.group(1)
-                a = const_eval(h0.group(2))
+                kind, v = h0.group(1), h0.group(2)
+                lit = 'u' if kind == 'uint' else ''
+                a = const_eval(h0.group(3))
                 hc = re.match(r'\s*%s\s*(<|<=)\s*(.+)$' % v, parts[1], re.S)
                 b = const_eval(hc.group(2)) if hc else None
                 inc = parts[2].strip()
@@ -150,10 +171,14 @@ def transform(s, max_trip, stats):
                     values = list(range(a, b, step))
                     assigns = re.search(r'(?<![\w.])%s\s*(=[^=]|\+\+|--|[-+*/]=)|(\+\+|--)\s*%s\b' % (v, v), body)
                     wanted = not PRIVATE_ONLY or indexes_private(body, v)
-                    if (wanted and len(values) <= max_trip and not assigns and not own_level_escape(body)
+                    leaves = own_level_escape(body)
+                    if (wanted and len(values) <= max_trip and not assigns and leaves <= {'continue'}
                             and stats['unrolled'] < stats.get('limit', 1 << 30)):
-                        # One block around the copies: the loop may be the body of an `if`.
-                        unrolled = '{ ' + ''.join('{ const int %s = %d; %s }' % (v, x, body) for x in values) + ' }'
+                        # One block around the copies: the loop may be the body of an `if`. With a
+                        # `continue`, `do ... while (false)` around each copy ends that copy.
+                        copy = '{ const %s %s = %d%s; do %s while (false); }' if leaves else '{ const %s %s = %d%s; %s }'
+                        unrolled = '{ ' + ''.join(copy % (kind, v, x, lit, bind_outer(body, v, '%d%s' % (x, lit), max_trip, stats))
+                                                  for x in values) + ' }'
                         stats['unrolled'] += 1
         if unrolled is None:
             stats['kept'] += 1
@@ -178,6 +203,9 @@ def main():
     for m in re.finditer(r'\bbuffer\s+\w+\s*\{([^}]*)\}', text):
         GLOBALS.update(re.findall(r'(\w+)\s*\[\s*\]', m.group(1)))
     GLOBALS.update(re.findall(r'\bshared\s+[\w<>, ]+?\s+(\w+)\s*\[', text))
+    mats = set(re.findall(r'\bcoopmat\s*<[^<>]*gl_ScopeSubgroup\s*,\s*16\s*,\s*16\s*,[^<>]*>\s+(\w+)', text))
+    if mats:   # 16x16 subgroup cooperative matrices: 8 components a lane (subgroup size 32)
+        text = re.sub(r'\b(%s)((?:\[[^\[\]]*\])*)\.length\(\)' % '|'.join(sorted(mats)), '8', text)
     stats = {'unrolled': 0, 'kept': 0, 'limit': a.limit}
     sys.setrecursionlimit(10000)
     out = transform(text, a.max_trip, stats)

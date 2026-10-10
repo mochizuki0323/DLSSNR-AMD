@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Build the Windows package (64-bit games on the AMD Windows driver):
-#   dlssnr-amd/     the network: Windows shaders (windows/build/assemble_product_data.sh)
+#   dlssnr-amd/     the network: Windows shaders (windows/build/assemble_product_data.sh), and in aco/ the
+#                   same network as ACO's machine code ([Network] ACO Mode = 1)
 #   model-tools/    dlssnr_extract_model.exe: install.ps1 makes the model from the user's nvngx_dlssnr.dll
-#   dxvk/           D3D9/10/11 -> Vulkan, and the DXGI both translators present through
-#   vkd3d-proton/   D3D12 -> Vulkan
-#   reshade/        ReShade as a Vulkan layer (patched loader beside the game) + our add-on
 #   optiscaler/     the OptiScaler-NR release, extracted, plus our NGX DLLs
+#   reshade/        ReShade + our add-on: dxgi.dll in DX10/11/12 games, a Vulkan layer otherwise
+#   dxvk/           D3D9 -> Vulkan, for the DX9 route only
+#   vulkan/         the Khronos loader the Vulkan-layer routes put beside the game
 #   install.bat, install.ps1, README.txt
 #
 #   [NR_MODEL=dlssnr.bin] bash windows/build/build_package.sh [build dir]
@@ -13,9 +14,9 @@
 # The package carries no model: install.ps1 extracts it from the user's nvngx_dlssnr.dll on the first
 # install. NR_MODEL puts a dlssnr.bin you made yourself into the package (for your own use only).
 #
-# The game has to run on Vulkan for the network to share its device, so every route puts DXVK and
-# vkd3d-proton in the game folder. DXVK's dxgi.dll then owns that name: OptiScaler, normally
-# dxgi.dll itself, loads it as dxgi-original.dll, and ReShade comes in as a Vulkan layer.
+# D3D10/11/12 games keep the system's own D3D: the network runs on a Vulkan device of its own and the
+# frame crosses over through shared textures and a shared fence (windows/src/pe/nr_pe_bridge.hpp).
+# Only DX9 games are translated (DXVK), because D3D9 shares neither textures nor fences.
 set -euo pipefail
 model=""
 if [[ -n "${NR_MODEL:-}" ]]; then
@@ -33,9 +34,9 @@ command -v "$cxx" >/dev/null || { echo "no mingw cross compiler ($cxx)" >&2; exi
 minhook=artifacts/ref/DLSS5-Feeder/external/minhook
 reshade_inc=artifacts/ref/DLSS5-Feeder/external/reshade/include
 proton=${NR_PROTON:-toolchain/GE-Proton11-7-x86_64/files}
-opti_zip=${NR_OPTI_ZIP:-artifacts/ref/downloads/OptiScaler-NR-v0.8.4.zip}
+opti_zip=${NR_OPTI_ZIP:-artifacts/ref/downloads/OptiScaler-NR-v0.8.91.zip}
 for dir in "$minhook" "$reshade_inc" artifacts/ref/reshade-shaders artifacts/ref/vort_Shaders \
-           "$proton/lib/wine/dxvk/x86_64-windows" "$proton/lib/wine/vkd3d-proton/x86_64-windows"; do
+           "$proton/lib/wine/dxvk/x86_64-windows"; do
     [[ -d "$dir" ]] || { echo "missing: $dir" >&2; exit 1; }
 done
 for f in "$opti_zip" artifacts/ref/reshade-6.8.0/ReShade64.dll; do
@@ -55,6 +56,8 @@ common=(-std=c++17 -O2 -DNDEBUG -DNR_BUILD_STAMP="\"$stamp\"" -Itoolchain/Vulkan
 "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_interop.cpp -o "$out/interop.o"
 "$cxx" "${common[@]}" -I"$minhook/include" -c windows/src/pe/nr_pe_vkdevice.cpp -o "$out/vkdevice.o"
 "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_session.cpp -o "$out/session.o"
+"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_bridge.cpp -o "$out/bridge.o"
+"$cxx" "${common[@]}" -c windows/src/pe/nr_pe_d3d12split.cpp -o "$out/d3d12split.o"
 "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_config.cpp -o "$out/config.o"
 # ReShade's headers include <Windows.h>; the case shim maps that onto mingw's.
 "$cxx" "${common[@]}" -Iwindows/src/pe/reshade_compat -I"$reshade_inc" -I"$minhook/include" \
@@ -68,7 +71,7 @@ ldflags=(-ld3d12 -ldxgi -ldwmapi -lgdi32 -lole32 -static -static-libgcc -static-
 # No static import of vulkan-1.dll (it would load before the game set up its graphics): every vk*
 # call goes through a pointer filled once Vulkan is in the process. The list is whatever a trial
 # link reports undefined.
-objs=("$out/reshade_addon.o" "$out/session.o" "$out/config.o" "$out/interop.o" "$out/log.o" "$out/crash.o"
+objs=("$out/reshade_addon.o" "$out/session.o" "$out/bridge.o" "$out/d3d12split.o" "$out/config.o" "$out/interop.o" "$out/log.o" "$out/crash.o"
       "$out/vkdevice.o" "$out/nr_runtime.o" "$out/nr_native_plan.o" "$out"/mh_*.o)
 undefined=$({ "$cxx" -shared -o /dev/null "${objs[@]}" "${ldflags[@]}" 2>&1 || true; } |
     grep -o "undefined reference to \`vk[A-Za-z0-9_]*'" | sed "s/.*\`//; s/'//" | sort -u)
@@ -111,28 +114,36 @@ if [[ -n "$model" ]]; then
 else
     bash windows/build/assemble_product_data.sh "$pkg"
 fi
+# dlssnr-amd/aco/: the network as ACO's machine code, used with [Network] ACO Mode = 1 in dlssnr-amd.ini (off by
+# default): one record per pipeline (windows/data/aco/records), the Linux network the records were made from
+# (linux/build/build_network.py; a record is found by its SPIR-V's hash) and the template aliases.
+aco="$pkg/dlssnr-amd/aco"
+mkdir -p -- "$aco/records"
+rm -rf -- "$out/aco-shaders"
+python3 linux/build/build_network.py rdna4 --out "$out/aco-shaders" > /dev/null
+cp -r -- "$out/aco-shaders" "$aco/shaders"
+cp -- windows/data/aco/records/*.nrp "$aco/records/"
+cp -- windows/data/aco/shell-aliases.txt "$aco/"
 # model-tools/: the extractor install.ps1 runs when the package has no model.
 bash windows/package/model-tools/build_extract_model.sh "$out/extract" > /dev/null
 mkdir -p -- "$pkg/model-tools"
 cp -- "$out/extract/dlssnr_extract_model.exe" "$pkg/model-tools/"
 
-# dxvk/, vkd3d-proton/: the translators, as GE-Proton ships them (PE builds; they run on Windows).
-mkdir -p -- "$pkg/dxvk" "$pkg/vkd3d-proton"
-for f in dxgi.dll d3d11.dll d3d10core.dll d3d9.dll; do cp -- "$proton/lib/wine/dxvk/x86_64-windows/$f" "$pkg/dxvk/"; done
-cp -- "$proton/lib/wine/vkd3d-proton/x86_64-windows/"{d3d12.dll,d3d12core.dll} "$pkg/vkd3d-proton/"
+# dxvk/: D3D9 (and the DXGI it was installed with) for the DX9 route, as GE-Proton ships them.
+mkdir -p -- "$pkg/dxvk"
+for f in dxgi.dll d3d9.dll; do cp -- "$proton/lib/wine/dxvk/x86_64-windows/$f" "$pkg/dxvk/"; done
 cat "$proton/lib/wine/dxvk/version" > "$pkg/dxvk/version.txt"
-cat "$proton/lib/wine/vkd3d-proton/version" > "$pkg/vkd3d-proton/version.txt"
 cp -- artifacts/ref/dxvk/LICENSE "$pkg/dxvk/LICENSE.txt"
-cp -- toolchain/vkd3d-proton-src/LICENSE "$pkg/vkd3d-proton/LICENSE.txt"
 
-# vulkan/: the Khronos loader both routes put beside the game (windows/build/build_vulkan_loader.sh):
-# never calls DXGI (OptiScaler route hang), and finds ReShade's layer manifest beside itself.
+# vulkan/: the Khronos loader the DX9 and Vulkan routes put beside the game (windows/build/build_vulkan_loader.sh):
+# never calls DXGI, and finds ReShade's layer manifest beside itself.
 mkdir -p -- "$pkg/vulkan"
 cp -- artifacts/windows/vulkan-loader/x86_64/vulkan-1.dll "$pkg/vulkan/"
 cp -- artifacts/windows/vulkan-loader/x86_64/LICENSE.txt "$pkg/vulkan/Vulkan-Loader-LICENSE.txt"
 cp -- artifacts/windows/vulkan-loader/x86_64/PATCHES.diff "$pkg/vulkan/Vulkan-Loader-PATCHES.diff"
 
-# reshade/: ReShade 6.8 (add-on build) as a Vulkan layer, found through that loader.
+# reshade/: ReShade 6.8 (add-on build): installed as dxgi.dll in DX10/11/12 games, and as a Vulkan layer
+# (vk-override/, found through that loader) for DX9 and Vulkan games.
 rs="$pkg/reshade"
 mkdir -p -- "$rs/reshade-shaders/Shaders" "$rs/reshade-shaders/Textures" "$rs/vk-override/implicit_layer"
 cp -- "$out/dlssnr_amd.addon64" artifacts/ref/reshade-6.8.0/ReShade64.dll "$rs/"
@@ -184,8 +195,7 @@ sed 's/^PreprocessorDefinitions=.*/&,RESHADE_DEPTH_INPUT_IS_REVERSED=0/' "$rs/Re
 for f in "$rs/ReShade.ini" "$rs/ReShadePreset.ini" "$rs/ReShadePreset-d3d9.ini"; do sed -i 's/$/\r/' "$f"; done
 
 # optiscaler/: the release extracted (backslash names normalised), without its own setup scripts;
-# OptiScaler.dll becomes dxgi.dll at install, our dxgi-original.dll sits behind it and DXVK's
-# dxgi.dll becomes dxgi-dxvk.dll (windows/src/pe/nr_dxgi_split.cpp).
+# OptiScaler.dll becomes dxgi.dll at install, in front of the system's DXGI.
 op="$pkg/optiscaler"
 mkdir -p -- "$op/game"
 python3 linux/package/optiscaler/extract_release.py "$opti_zip" "$op/game" > /dev/null
@@ -194,8 +204,13 @@ python3 linux/package/optiscaler/extract_release.py "$opti_zip" "$op/game" > /de
       INSTALL-DLSSNR.md SHA256SUMS.txt )
 # Our NGX core ships as dlssnr_core.dll, not under NVIDIA's name: a loaded _nvngx.dll is taken by
 # Streamline for NVIDIA's own core, and ours offers no DLSS (linux/build/build_package.sh).
-cp -- artifacts/windows/optiscaler/{nvngx.dll_dlssnr.dll,nvngx_dlssnr.dll,dxgi-original.dll} "$op/"
+cp -- artifacts/windows/optiscaler/{nvngx.dll_dlssnr.dll,nvngx_dlssnr.dll} "$op/"
 cp -- artifacts/windows/optiscaler/_nvngx.dll "$op/dlssnr_core.dll"
+
+# dlssnr-amd.ini, put in place at install: the text the programs write themselves (windows/package/make_ini.py),
+# with the line ends a Windows program writes.
+python3 windows/package/make_ini.py windows/src/pe/nr_pe_config.cpp "$pkg/ini" > /dev/null
+sed -i 's/$/\r/' "$pkg/ini/"*.ini
 
 cp -- windows/package/install.bat windows/package/README.txt "$pkg/"
 # Windows PowerShell 5.1 reads a script without a byte-order mark in the ANSI code page.
@@ -204,7 +219,9 @@ printf '\xef\xbb\xbf' > "$pkg/README.txt"; sed 's/$/\r/' windows/package/README.
 sed -i 's/$/\r/' "$pkg/install.bat"
 
 # ---- archive ------------------------------------------------------------------------------------
-name="DLSSNR-AMD-Vulkan-Windows-$stamp-preview-x86_64"
+# A Windows-only release's version already says preview (v0.0.4-win-preview).
+preview=-preview; [[ "$stamp" == *preview* ]] && preview=
+name="DLSSNR-AMD-Vulkan-Windows-$stamp$preview-x86_64"
 rm -f -- "$out/$name.zip"
 python3 - "$pkg" "$out/$name.zip" <<'PY'
 import os, sys, zipfile

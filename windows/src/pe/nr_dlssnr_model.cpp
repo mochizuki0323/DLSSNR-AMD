@@ -141,14 +141,17 @@ nr::Preprocess preprocess_now() {
 // is the only way to read "the model ran" or "it passed the frame through, and why" off a log
 // without a debugger, and a user reporting that a control does nothing is asking exactly that.
 void log_evaluate(Feature* f, const char* api, unsigned int w, unsigned int h, const void* in,
-                  const void* out, bool reset, bool ran, const char* why, float gpu_ms) {
+                  const void* out, bool reset, bool ran, const char* why, float gpu_ms, float network_ms) {
     const uint64_t n = ++f->evaluates;
     if (n > 3 && n % 300 != 0) return;
     // owner is always 1 now: every feature owns its own temporal history.
-    // `gpu_ms` is the pass's own cost from the GPU's timestamps, the same number
-    // OptiScaler's overlay reports beside DLSS-NR; zero means no result yet.
-    char cost[32] = "";
-    if (gpu_ms > 0.0f) std::snprintf(cost, sizeof cost, ", %.2f ms", gpu_ms);
+    // `gpu_ms` is the pass's own cost from the GPU's timestamps, `network_ms` the network's part of
+    // it (the rest is the work around it: input, composition, copies); zero means no result yet.
+    char cost[64] = "";
+    if (gpu_ms > 0.0f && network_ms > 0.0f)
+        std::snprintf(cost, sizeof cost, ", %.2f ms (network %.2f, route %.2f)", gpu_ms, network_ms,
+                      gpu_ms > network_ms ? gpu_ms - network_ms : 0.0f);
+    else if (gpu_ms > 0.0f) std::snprintf(cost, sizeof cost, ", %.2f ms", gpu_ms);
     log("[nr] evaluate #%u (%s, %u) %ux%u in=%p out=%p reset=%d owner=1%s -> %s%s%s",
         static_cast<unsigned>(f->id), api, static_cast<unsigned>(n), w, h, in,
         out, reset ? 1 : 0, cost, ran ? "ran" : "passthrough(", ran ? "" : (why ? why : "unknown"),
@@ -873,13 +876,12 @@ void write_evaluate_keys(void* params, const Controls6& c, bool reset, int depth
 }
 
 // ---------------------------------------------------------------------------------------------
-// Direct3D 12, through vkd3d-proton.
+// Direct3D 12: through vkd3d-proton, or the native runtime through the bridge.
 // ---------------------------------------------------------------------------------------------
 
 // Creates the persistent feature. Unlike the reference this records nothing into `cmd`: NGX builds
 // its feature on the command list and so must outlive its execution, whereas nr::Runtime is built on
-// the session's own queue on a background thread. The device is validated here so that a machine
-// without vkd3d-proton interop fails at create with a legible reason rather than every frame.
+// the session's own queue on a background thread.
 Feature* create_d3d12(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, void* params,
                       unsigned int width, unsigned int height, int preset, int ui_correction,
                       const Controls6& controls, int* out_result) {
@@ -892,15 +894,10 @@ Feature* create_d3d12(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, void
 
     if (!device || !cmd) return fail(static_cast<int>(NVSDK_NGX_Result_FAIL_InvalidParameter));
 
-    const nr::pe::DeviceHandles handles = nr::pe::device_handles(device);
-    if (!handles.valid()) {
-        g_last_error = "this D3D12 device exposes no Vulkan handles; the AMD backend needs "
-                       "vkd3d-proton, not native Windows D3D12";
-        log("[nr] model create (D3D12): %s", g_last_error.c_str());
-        return fail(static_cast<int>(NVSDK_NGX_Result_FAIL_PlatformError));
-    }
-
-    if (nr::pe::command_buffer(cmd) == VK_NULL_HANDLE) {
+    // Under vkd3d-proton the network records into the game's own command buffer, which has to be
+    // there; on the native runtime it runs on the bridge (nr_pe_bridge.hpp) and needs neither.
+    const bool bridged = d3d12_session().bridged(device);
+    if (!bridged && nr::pe::command_buffer(cmd) == VK_NULL_HANDLE) {
         g_last_error = "the command list exposes no VkCommandBuffer";
         log("[nr] model create (D3D12): %s", g_last_error.c_str());
         return fail(static_cast<int>(NVSDK_NGX_Result_FAIL_PlatformError));
@@ -982,18 +979,21 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
     }
 
     // Seed: output := color. The states are the ones DlssNr_Dx12.cpp holds across the call.
+    // Only when the network does not write the output from the colour itself (see below).
     const D3D12_RESOURCE_STATES kColorState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     const D3D12_RESOURCE_STATES kOutputState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    barrier(cmd, color, kColorState, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    barrier(cmd, output, kOutputState, D3D12_RESOURCE_STATE_COPY_DEST);
-    cmd->CopyResource(output, color);
-    barrier(cmd, color, D3D12_RESOURCE_STATE_COPY_SOURCE, kColorState);
-    barrier(cmd, output, D3D12_RESOURCE_STATE_COPY_DEST, kOutputState);
+    const auto seed = [&] {
+        barrier(cmd, color, kColorState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        barrier(cmd, output, kOutputState, D3D12_RESOURCE_STATE_COPY_DEST);
+        cmd->CopyResource(output, color);
+        barrier(cmd, color, D3D12_RESOURCE_STATE_COPY_SOURCE, kColorState);
+        barrier(cmd, output, D3D12_RESOURCE_STATE_COPY_DEST, kOutputState);
+    };
 
-    // (a) the model's input: the output as the seed left it, which is the colour byte for byte.
+    // (a) the model's input: the colour (what the seed would put in the output, byte for byte).
     bool readback_recorded = false;
     if (readback_sample && readback_ensure(device, *f->debug, output)) {
-        readback_record(cmd, *f->debug, output, kOutputState, f->debug->in);
+        readback_record(cmd, *f->debug, color, kColorState, f->debug->in);
         readback_recorded = true;
     }
 
@@ -1056,8 +1056,27 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
     for (const Feature* o : g_live_d3d12)
         if (o->id < f->id) ++pass_number;
     const bool skipped = debug_skip_pass() > 0 && pass_number == debug_skip_pass();
-    const bool ran = skipped ? false
-                             : session.run_after(device, cmd, output, kOutputState, resources, f->controls);
+    // The network reads the colour and writes the output (no seed copy; its post block stores
+    // into the output when it can). Where it cannot - still building, a failure, a format or
+    // extent mismatch, the model not applied - the output is seeded and the pass runs in place
+    // as before. NR_SEED_COPY=1 keeps the old order for comparisons.
+    static const bool seed_always = [] { const char* e = std::getenv("NR_SEED_COPY"); return e && std::atoi(e); }();
+    bool ran = false;
+    if (!skipped && !seed_always) {
+        // the seed copy's D3D12 transitions were also what made vkd3d-proton
+        // flush transfer work it batches on the CPU (a caller's CopyTextureRegion into the colour)
+        // into the command buffer before our raw Vulkan commands. A global UAV barrier - a real
+        // D3D12 command - does that without the copy.
+        D3D12_RESOURCE_BARRIER uav{};
+        uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        uav.UAV.pResource = nullptr;
+        cmd->ResourceBarrier(1, &uav);
+        ran = session.run_after(device, cmd, output, kOutputState, resources, f->controls, color, kColorState);
+    }
+    if (!ran) {
+        seed();
+        ran = skipped ? false : session.run_after(device, cmd, output, kOutputState, resources, f->controls);
+    }
 
     // (b) the model's answer, from the same resource in the same state, so the only difference
     // between the two buffers is what run_after recorded between them.
@@ -1082,7 +1101,7 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
                       : session.failed() ? "failed"
                       : session.building() ? "building" : "declined";
     log_evaluate(f, "D3D12", width, height, static_cast<const void*>(color),
-                 static_cast<const void*>(output), resources.reset, ran, why, session.gpu_ms());
+                 static_cast<const void*>(output), resources.reset, ran, why, session.gpu_ms(), session.network_ms());
     if (readback && f->debug) readback_log(f, *f->debug);
     // The Vulkan identities behind the D3D12 pointers, for the multipass question: does pass k's
     // colour really alias the buffer pass k-1 wrote, or the untouched model input? Same rate limit.
@@ -1239,6 +1258,25 @@ int evaluate_vk(void* cmd_buffer, Feature* f, void* params, const void* color, c
     frame.colour_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     frame.upscaler_input = false;   // OptiScaler already tone-mapped this; see EngineResources::colour_encoded
 
+    // The output written directly (Session::run_vulkan): only when it is the colour's twin - same
+    // format, and both descriptors' extents are the working size (no subrect to crop). The colour is
+    // an NGX input (sampled; this path already copies from it) and the output an NGX output this
+    // path already copies into; NGX's ReadWrite flag is the UAV one, i.e. storage usage - OptiScaler
+    // creates both with STORAGE|SAMPLED|TRANSFER and marks them ReadWrite.
+    {
+        uint32_t cw = 0, ch = 0; VkImage ci{}; VkFormat cf{};
+        image_of(color, &ci, &cf, &cw, &ch);
+        if (out_format == frame.colour_format && out_w == frame.width && out_h == frame.height &&
+            cw == frame.width && ch == frame.height) {
+            frame.output = out_image;
+            frame.output_layout = VK_IMAGE_LAYOUT_GENERAL;
+            frame.colour_usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                 (static_cast<const NVSDK_NGX_Resource_VK*>(color)->ReadWrite ? VK_IMAGE_USAGE_STORAGE_BIT : 0u);
+            frame.output_usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                 (static_cast<const NVSDK_NGX_Resource_VK*>(output)->ReadWrite ? VK_IMAGE_USAGE_STORAGE_BIT : 0u);
+        }
+    }
+
     if (image_of(motion, &frame.motion, &frame.motion_format, &frame.motion_width,
                  &frame.motion_height)) {
         frame.motion_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -1267,7 +1305,9 @@ int evaluate_vk(void* cmd_buffer, Feature* f, void* params, const void* color, c
     VkImage answer = session.run_vulkan(g_vk_handles, cmd, frame, f->controls);
 
     const bool ran = answer != VK_NULL_HANDLE;
-    if (!ran) {
+    if (ran && answer == out_image) {
+        // Written in place by the network (Session::run_vulkan with VulkanFrame::output).
+    } else if (!ran) {
         // Still building, or declined. The output has to carry a picture either way, so it gets the
         // input unchanged -- the pass becomes a no-op rather than a black frame. OptiScaler's resolve
         // blends output against the same proxy, so an identical copy composites to exactly the proxy.
@@ -1284,7 +1324,7 @@ int evaluate_vk(void* cmd_buffer, Feature* f, void* params, const void* color, c
     // A C-style cast through uintptr_t: VkImage is a pointer on x86_64 and a
     // uint64_t on i686, and static_cast is legal for only one of them.
     log_evaluate(f, "Vulkan", frame.width, frame.height, (const void*)(uintptr_t)(frame.colour),
-                 (const void*)(uintptr_t)(out_image), frame.reset, ran, why, session.gpu_ms());
+                 (const void*)(uintptr_t)(out_image), frame.reset, ran, why, session.gpu_ms(), session.network_ms());
     if (!ran && !session.status().empty()) {
         g_last_error = session.status();
         static std::string reported;

@@ -1,0 +1,101 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Classic enlargement with a scaler other than bilinear: the model's answer, model-sized, enlarged to the
+// frame for runtime_transfer.comp. Display-encoded values (an SDR frame's own, or the proxy of a linear
+// one). up_shown is bound but not written.
+//
+//   scaler 1  Catmull-Rom: separable 4x4, B = 0, C = 0.5
+//   scaler 2  Lanczos3: separable 6x6
+//   scaler 3  FSR 1 EASU, AMD FidelityFX Super Resolution 1.0 (include/fsr1, MIT)
+//
+// The first two are clamped to the 2x2 texels around the sample, as EASU clamps itself: a ringing lobe
+// would be a halo the model never drew.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, rgba32f) uniform readonly image2D result;     // the model's answer, model-sized
+layout(set = 0, binding = 1) uniform sampler2D shown;                      // what it was shown, model-sized
+layout(set = 0, binding = 2, rgba32f) uniform writeonly image2D up_result; // frame-sized
+layout(set = 0, binding = 3, rgba32f) uniform writeonly image2D up_shown;  // frame-sized
+layout(push_constant) uniform Push {
+    uint width, height;       // the frame
+    uint model_w, model_h;    // `result` and `shown`
+    uint scaler;
+} pc;
+
+uint which;   // 0: result, 1: shown
+
+vec3 fetch(ivec2 p) {
+    p = clamp(p, ivec2(0), ivec2(pc.model_w, pc.model_h) - 1);
+    return which == 0u ? imageLoad(result, p).rgb : texelFetch(shown, p, 0).rgb;
+}
+
+// ---- FSR 1 EASU ----------------------------------------------------------------------------------
+#define A_GPU 1
+#define A_GLSL 1
+#include "fsr1/ffx_a.h"
+#define FSR_EASU_F 1
+// textureGather's footprint for the texel square containing `p` (normalised coordinates):
+// x = (0,1), y = (1,1), z = (1,0), w = (0,0) relative to the lower-left texel.
+ivec2 gather_base(AF2 p) { return ivec2(floor(p * vec2(pc.model_w, pc.model_h) - 0.5)); }
+AF4 gather(AF2 p, int c) {
+    const ivec2 b = gather_base(p);
+    return AF4(fetch(b + ivec2(0, 1))[c], fetch(b + ivec2(1, 1))[c], fetch(b + ivec2(1, 0))[c], fetch(b)[c]);
+}
+AF4 FsrEasuRF(AF2 p) { return gather(p, 0); }
+AF4 FsrEasuGF(AF2 p) { return gather(p, 1); }
+AF4 FsrEasuBF(AF2 p) { return gather(p, 2); }
+#include "fsr1/ffx_fsr1.h"
+
+vec3 easu(ivec2 xy) {
+    AU4 con0, con1, con2, con3;
+    FsrEasuCon(con0, con1, con2, con3, AF1(pc.model_w), AF1(pc.model_h), AF1(pc.model_w), AF1(pc.model_h),
+               AF1(pc.width), AF1(pc.height));
+    AF3 c;
+    FsrEasuF(c, AU2(xy), con0, con1, con2, con3);
+    return c;
+}
+
+// ---- separable kernels ---------------------------------------------------------------------------
+float catmull_rom(float x) {
+    x = abs(x);
+    if (x < 1.0) return 1.5 * x * x * x - 2.5 * x * x + 1.0;
+    if (x < 2.0) return -0.5 * x * x * x + 2.5 * x * x - 4.0 * x + 2.0;
+    return 0.0;
+}
+float lanczos3(float x) {
+    x = abs(x);
+    if (x < 1e-5) return 1.0;
+    if (x >= 3.0) return 0.0;
+    const float px = 3.14159265358979 * x;
+    return 3.0 * sin(px) * sin(px / 3.0) / (px * px);
+}
+
+vec3 separable(ivec2 xy, int radius) {
+    const vec2 p = (vec2(xy) + 0.5) * (vec2(pc.model_w, pc.model_h) / vec2(pc.width, pc.height)) - 0.5;
+    const ivec2 base = ivec2(floor(p));
+    const vec2 f = p - vec2(base);
+    vec3 sum = vec3(0.0);
+    float wsum = 0.0;
+    for (int j = 1 - radius; j <= radius; ++j) {
+        const float wy = radius == 2 ? catmull_rom(float(j) - f.y) : lanczos3(float(j) - f.y);
+        for (int i = 1 - radius; i <= radius; ++i) {
+            const float w = wy * (radius == 2 ? catmull_rom(float(i) - f.x) : lanczos3(float(i) - f.x));
+            sum += w * fetch(base + ivec2(i, j));
+            wsum += w;
+        }
+    }
+    vec3 c = sum / wsum;
+    const vec3 a = fetch(base), b = fetch(base + ivec2(1, 0)), d = fetch(base + ivec2(0, 1)), e = fetch(base + ivec2(1, 1));
+    return clamp(c, min(min(a, b), min(d, e)), max(max(a, b), max(d, e)));
+}
+
+vec3 enlarge(ivec2 xy) {
+    if (pc.scaler == 3u) return easu(xy);
+    return separable(xy, pc.scaler == 2u ? 3 : 2);
+}
+
+void main() {
+    const ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    if (xy.x >= int(pc.width) || xy.y >= int(pc.height)) return;
+    which = 0u;
+    imageStore(up_result, xy, vec4(enlarge(xy), 1.0));
+}

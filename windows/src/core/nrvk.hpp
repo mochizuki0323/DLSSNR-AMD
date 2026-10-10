@@ -12,6 +12,7 @@
 // allocate the same arenas out of device-local memory.
 #pragma once
 #include <vulkan/vulkan.h>
+#include "nr_pipeline_binary.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -19,6 +20,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <algorithm>
@@ -29,9 +31,21 @@
 
 namespace nrvk {
 
+// The host ran out of memory or address space (VK_ERROR_OUT_OF_HOST_MEMORY,
+// VK_ERROR_MEMORY_MAP_FAILED). A std::bad_alloc, so callers that retry a build
+// after a host-memory failure (a 32-bit game while it is loading) treat it as
+// one; everything else that catches std::exception still does.
+struct HostMemoryError : std::bad_alloc {
+    std::string text;
+    explicit HostMemoryError(std::string t) : text(std::move(t)) {}
+    const char* what() const noexcept override { return text.c_str(); }
+};
+
 inline void check(VkResult r, const char* what) {
-    if (r != VK_SUCCESS)
-        throw std::runtime_error(std::string(what) + ": VkResult=" + std::to_string(r));
+    if (r == VK_SUCCESS) return;
+    std::string text = std::string(what) + ": VkResult=" + std::to_string(r);
+    if (r == VK_ERROR_OUT_OF_HOST_MEMORY || r == VK_ERROR_MEMORY_MAP_FAILED) throw HostMemoryError(std::move(text));
+    throw std::runtime_error(text);
 }
 #define NRVK_CHECK(expr) ::nrvk::check((expr), #expr)
 
@@ -207,7 +221,29 @@ struct Context {
                               VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME};
         VkDeviceCreateInfo di{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
         di.pNext = &coop; di.queueCreateInfoCount = 1; di.pQueueCreateInfos = &qi;
-        di.enabledExtensionCount = have_wml ? 3 : 2; di.ppEnabledExtensionNames = exts;
+        std::vector<const char*> ext_list(exts, exts + (have_wml ? 3 : 2));
+        // Our pipelines ask for no robust buffer / image access (Kernel::create); the feature that allows it.
+        VkPhysicalDevicePipelineRobustnessFeaturesEXT prf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT};
+        {
+            VkPhysicalDeviceFeatures2 q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            q.pNext = &prf;
+            vkGetPhysicalDeviceFeatures2(physical, &q);
+            uint32_t ne = 0;
+            vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, nullptr);
+            std::vector<VkExtensionProperties> have(ne);
+            vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, have.data());
+            bool listed = false;
+            for (const auto& e : have) listed |= !std::strcmp(e.extensionName, VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
+            if (prf.pipelineRobustness && listed) {
+                prf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT};
+                prf.pipelineRobustness = VK_TRUE;
+                VkBaseOutStructure* tail = reinterpret_cast<VkBaseOutStructure*>(&coop);
+                while (tail->pNext) tail = tail->pNext;
+                tail->pNext = reinterpret_cast<VkBaseOutStructure*>(&prf);
+                ext_list.push_back(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
+                pipeline_robustness = true;
+            }
+        }
 #ifdef NR_PIPELINE_STATS
         VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pex{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
@@ -216,11 +252,10 @@ struct Context {
             q.pNext = &pex;
             vkGetPhysicalDeviceFeatures2(physical, &q);
         }
-        std::vector<const char*> stat_exts(exts, exts + di.enabledExtensionCount);
         if (pex.pipelineExecutableInfo) {
             pex.pNext = const_cast<void*>(di.pNext); di.pNext = &pex;
-            stat_exts.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
-            di.enabledExtensionCount = uint32_t(stat_exts.size()); di.ppEnabledExtensionNames = stat_exts.data();
+            ext_list.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+            di.enabledExtensionCount = uint32_t(ext_list.size()); di.ppEnabledExtensionNames = ext_list.data();
             pipeline_stats = true;
         }
         std::printf("pipeline statistics: %s\n", pipeline_stats ? "on" : "not supported by the driver");
@@ -233,12 +268,16 @@ struct Context {
         }
         if (clk.shaderSubgroupClock && clk.shaderDeviceClock) {
             clk.pNext = const_cast<void*>(di.pNext); di.pNext = &clk;
-            stat_exts.push_back(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
-            di.enabledExtensionCount = uint32_t(stat_exts.size()); di.ppEnabledExtensionNames = stat_exts.data();
+            ext_list.push_back(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
+            di.enabledExtensionCount = uint32_t(ext_list.size()); di.ppEnabledExtensionNames = ext_list.data();
         }
         std::printf("shader clocks: %s\n", clk.shaderSubgroupClock && clk.shaderDeviceClock ? "on" : "not supported");
 #endif
+        di.enabledExtensionCount = uint32_t(ext_list.size()); di.ppEnabledExtensionNames = ext_list.data();
+        nr::binary::Features binary_features;
+        binary_features.prepare(physical, di, ext_list);
         NRVK_CHECK(vkCreateDevice(physical, &di, nullptr, &device));
+        if (binary_features.active) nr::binary::mark(device);
         vkGetDeviceQueue(device, family, 0, &queue);
         vkGetPhysicalDeviceMemoryProperties(physical, &mem);
     }
@@ -276,9 +315,13 @@ struct Context {
         // memory blocks (NR_UPS_ALIAS), which needs this extension.
         VkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR wml{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_FEATURES_KHR};
+        VkPhysicalDevicePipelineRobustnessFeaturesEXT prf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT};
         VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-        f2.pNext = &c; c.pNext = &f8; f8.pNext = &v11; v11.pNext = &v12; v12.pNext = &v13; v13.pNext = &wml;
+        f2.pNext = &c; c.pNext = &f8; f8.pNext = &v11; v11.pNext = &v12; v12.pNext = &v13; v13.pNext = &wml; wml.pNext = &prf;
         vkGetPhysicalDeviceFeatures2(physical, &f2);
+        // DXVK and vkd3d-proton create their devices with robustBufferAccess2 and without this feature; RADV
+        // compiles a pipeline by its own VkPipelineRobustnessCreateInfo whether or not the device enabled it.
+        pipeline_robustness = prf.pipelineRobustness;
         if (!c.cooperativeMatrix)             return no("cooperativeMatrix");
         if (!f8.shaderFloat8)                 return no("shaderFloat8");
         if (!f8.shaderFloat8CooperativeMatrix) return no("shaderFloat8CooperativeMatrix");
@@ -311,6 +354,10 @@ struct Context {
     }
     // `destroy` must not tear down a device it did not create.
     bool adopted = false;
+    // The driver has VK_EXT_pipeline_robustness: Kernel::create compiles every pipeline without robust buffer and
+    // image access. Every access of ours is in bounds, so the output is the same; on a device with
+    // robustBufferAccess2 (DXVK, vkd3d-proton) the robust pipelines are slower.
+    bool pipeline_robustness = false;
 
     // ---- the pipeline cache, on disk ---------------------------------------
     //
@@ -474,40 +521,61 @@ struct Context {
         return b;
     }
 
-    // One-shot staged transfer. Setup path only - no attempt at overlap, and
-    // the staging buffer lives exactly as long as the copy.
+    // Staged transfers. Setup path only - no attempt at overlap.
+    //
+    // **The staging buffer is at most kStageBytes, and big copies go through
+    // it in pieces.** A mapping as large as the copy (the weights, a 4K input
+    // image) needs that much contiguous address space, which a 32-bit game
+    // often does not have (vkMapMemory: VK_ERROR_MEMORY_MAP_FAILED).
+    static constexpr VkDeviceSize kStageBytes = VkDeviceSize(16) << 20;
+
     void transfer(Buffer& gpu, VkDeviceSize offset, void* host, VkDeviceSize bytes, bool to_gpu) {
         if (!bytes) return;
-        Buffer stage = buffer(bytes, true);
-        if (to_gpu) std::memcpy(stage.mapped, host, bytes);
-        VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-        cpi.queueFamilyIndex = family;
-        VkCommandPool pool;
-        NRVK_CHECK(vkCreateCommandPool(device, &cpi, nullptr, &pool));
-        VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        cai.commandPool = pool; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = 1;
-        VkCommandBuffer cmd;
-        NRVK_CHECK(vkAllocateCommandBuffers(device, &cai, &cmd));
-        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        NRVK_CHECK(vkBeginCommandBuffer(cmd, &bi));
-        VkBufferCopy region{};
-        region.srcOffset = to_gpu ? 0 : offset;
-        region.dstOffset = to_gpu ? offset : 0;
-        region.size = bytes;
-        vkCmdCopyBuffer(cmd, to_gpu ? stage.handle : gpu.handle,
-                        to_gpu ? gpu.handle : stage.handle, 1, &region);
-        NRVK_CHECK(vkEndCommandBuffer(cmd));
-        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
-        VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        VkFence fence;
-        NRVK_CHECK(vkCreateFence(device, &fi, nullptr, &fence));
-        submit(si, fence);
-        NRVK_CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, 30000000000ull));
-        if (!to_gpu) std::memcpy(host, stage.mapped, bytes);
-        vkDestroyFence(device, fence, nullptr);
-        vkDestroyCommandPool(device, pool, nullptr);
+        const VkDeviceSize chunk = std::min(bytes, kStageBytes);
+        Buffer stage = buffer(chunk, true);
+        try {
+            for (VkDeviceSize done = 0; done < bytes; done += chunk) {
+                const VkDeviceSize n = std::min(chunk, bytes - done);
+                uint8_t* h = static_cast<uint8_t*>(host) + done;
+                if (to_gpu) std::memcpy(stage.mapped, h, size_t(n));
+                one_shot([&](VkCommandBuffer cmd) {
+                    VkBufferCopy region{};
+                    region.srcOffset = to_gpu ? 0 : offset + done;
+                    region.dstOffset = to_gpu ? offset + done : 0;
+                    region.size = n;
+                    vkCmdCopyBuffer(cmd, to_gpu ? stage.handle : gpu.handle,
+                                    to_gpu ? gpu.handle : stage.handle, 1, &region);
+                });
+                if (!to_gpu) std::memcpy(h, stage.mapped, size_t(n));
+            }
+        } catch (...) {
+            destroy(stage);
+            throw;
+        }
+        destroy(stage);
+    }
+    // A buffer upload whose bytes are produced a staging piece at a time:
+    // `fill(offset, n, dst)` writes bytes offset..offset+n of the range into dst.
+    // The source never has to be one block (the graph's weight arena is chunked).
+    void upload_with(Buffer& gpu, VkDeviceSize offset, VkDeviceSize bytes,
+                     const std::function<void(VkDeviceSize, VkDeviceSize, uint8_t*)>& fill) {
+        if (!bytes) return;
+        const VkDeviceSize chunk = std::min(bytes, kStageBytes);
+        Buffer stage = buffer(chunk, true);
+        try {
+            for (VkDeviceSize done = 0; done < bytes; done += chunk) {
+                const VkDeviceSize n = std::min(chunk, bytes - done);
+                fill(done, n, static_cast<uint8_t*>(stage.mapped));
+                one_shot([&](VkCommandBuffer cmd) {
+                    VkBufferCopy region{};
+                    region.srcOffset = 0; region.dstOffset = offset + done; region.size = n;
+                    vkCmdCopyBuffer(cmd, stage.handle, gpu.handle, 1, &region);
+                });
+            }
+        } catch (...) {
+            destroy(stage);
+            throw;
+        }
         destroy(stage);
     }
     void upload(Buffer& b, VkDeviceSize off, const void* data, VkDeviceSize bytes) {
@@ -653,27 +721,52 @@ struct Context {
         im.layout = to;
     }
 
-    void image_transfer(Image& im, void* host, VkDeviceSize bytes, bool to_gpu) {
-        Buffer stage = buffer(bytes, true);
-        if (to_gpu) std::memcpy(stage.mapped, host, bytes);
+    // The image's rows, `rows` at a time through one staging buffer of at
+    // most kStageBytes (see `transfer`). `io(y0, n, stage)` writes rows
+    // y0..y0+n into the staging memory on the way to the GPU, and reads them
+    // from it on the way back. Tightly packed rows, bytes / h each.
+    void image_rows(Image& im, VkDeviceSize bytes, bool to_gpu,
+                    const std::function<void(uint32_t, uint32_t, uint8_t*)>& io) {
+        if (!bytes || !im.h) return;
+        const VkDeviceSize row = bytes / im.h;
+        const uint32_t step = uint32_t(std::max<VkDeviceSize>(1, std::min<VkDeviceSize>(im.h, kStageBytes / row)));
+        Buffer stage = buffer(row * step, true);
         const VkImageLayout keep = im.layout;
-        transition(im, to_gpu ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
-                              : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        one_shot([&](VkCommandBuffer cmd) {
-            VkBufferImageCopy r{};
-            r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            r.imageExtent = {im.w, im.h, 1};
-            if (to_gpu)
-                vkCmdCopyBufferToImage(cmd, stage.handle, im.handle,
-                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
-            else
-                vkCmdCopyImageToBuffer(cmd, im.handle,
-                                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                       stage.handle, 1, &r);
-        });
-        transition(im, keep);
-        if (!to_gpu) std::memcpy(host, stage.mapped, bytes);
+        try {
+            transition(im, to_gpu ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+                                  : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            for (uint32_t y0 = 0; y0 < im.h; y0 += step) {
+                const uint32_t n = std::min(step, im.h - y0);
+                if (to_gpu) io(y0, n, static_cast<uint8_t*>(stage.mapped));
+                one_shot([&](VkCommandBuffer cmd) {
+                    VkBufferImageCopy r{};
+                    r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                    r.imageOffset = {0, int32_t(y0), 0};
+                    r.imageExtent = {im.w, n, 1};
+                    if (to_gpu)
+                        vkCmdCopyBufferToImage(cmd, stage.handle, im.handle,
+                                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+                    else
+                        vkCmdCopyImageToBuffer(cmd, im.handle,
+                                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                               stage.handle, 1, &r);
+                });
+                if (!to_gpu) io(y0, n, static_cast<uint8_t*>(stage.mapped));
+            }
+            transition(im, keep);
+        } catch (...) {
+            destroy(stage);
+            throw;
+        }
         destroy(stage);
+    }
+    void image_transfer(Image& im, void* host, VkDeviceSize bytes, bool to_gpu) {
+        const VkDeviceSize row = im.h ? bytes / im.h : 0;
+        uint8_t* h = static_cast<uint8_t*>(host);
+        image_rows(im, bytes, to_gpu, [&](uint32_t y0, uint32_t n, uint8_t* stage) {
+            if (to_gpu) std::memcpy(stage, h + y0 * row, size_t(n * row));
+            else std::memcpy(h + y0 * row, stage, size_t(n * row));
+        });
     }
     void upload(Image& im, const void* data, VkDeviceSize bytes) {
         image_transfer(im, const_cast<void*>(data), bytes, true);
@@ -705,7 +798,7 @@ struct Context {
         // An adopted device belongs to the host application. Tearing it down
         // here would take the game with it.
         if (!adopted) {
-            if (device) vkDestroyDevice(device, nullptr);
+            if (device) { nr::binary::forget(device); vkDestroyDevice(device, nullptr); }
             if (instance) vkDestroyInstance(instance, nullptr);
         }
         device = VK_NULL_HANDLE; instance = VK_NULL_HANDLE;
@@ -735,6 +828,7 @@ struct Kernel {
     VkPipeline pipeline{};
     VkDescriptorPool pool{};
     VkDescriptorSet set{};
+    uint32_t push_range{};   // the layout's push constant bytes
 
     // **Image bindings follow the buffers**, in set 0, continuing the binding
     // numbers. The two image adapters are the only layers that need them - a
@@ -749,6 +843,7 @@ struct Kernel {
                 const std::vector<VkBuffer>& bindings, uint32_t push_bytes,
                 const std::vector<Context::Image*>& images = {}) {
         device = ctx.device;
+        push_range = push_bytes;
         const uint32_t nb = uint32_t(bindings.size());
         const uint32_t ni = uint32_t(images.size());
         const uint32_t n = nb + ni;
@@ -813,8 +908,14 @@ struct Kernel {
         cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         cpi.stage.module = module; cpi.stage.pName = "main";
         cpi.layout = layout;
+        VkPipelineRobustnessCreateInfoEXT robustness{VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO_EXT};
+        robustness.storageBuffers = robustness.uniformBuffers = robustness.vertexInputs =
+            VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT;
+        robustness.images = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
+        if (ctx.pipeline_robustness) cpi.pNext = &robustness;
 #ifndef NR_PIPELINE_STATS
-        NRVK_CHECK(vkCreateComputePipelines(device, ctx.pipeline_cache, 1, &cpi, nullptr, &pipeline));
+        NRVK_CHECK(nr::binary::create_or_default(device, ctx.pipeline_cache, cpi, spirv_path,
+                                                code.data(), code.size() * 4, &pipeline, push_bytes));
 #else
         if (ctx.pipeline_stats) cpi.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
         // NR_DUMP_IR=<dir> (evaluation builds): also capture the driver's internal representations
@@ -823,8 +924,8 @@ struct Kernel {
         if (ctx.pipeline_stats && dump_ir && *dump_ir)
             cpi.flags |= VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
         const auto t0 = std::chrono::steady_clock::now();
-        const VkResult made = vkCreateComputePipelines(device, (dump_ir && *dump_ir) ? VK_NULL_HANDLE : ctx.pipeline_cache,
-                                                       1, &cpi, nullptr, &pipeline);
+        const VkResult made = nr::binary::create_or_default(device, (dump_ir && *dump_ir) ? VK_NULL_HANDLE : ctx.pipeline_cache,
+                                                       cpi, spirv_path, code.data(), code.size() * 4, &pipeline, push_bytes);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         const std::string base = spirv_path.substr(spirv_path.find_last_of("/\\") + 1);
         std::printf("pipeline %s: %s in %.1f ms", base.c_str(), made == VK_SUCCESS ? "built" : "FAILED", ms);

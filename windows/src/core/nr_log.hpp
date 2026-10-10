@@ -11,8 +11,10 @@
 // So the runtime writes through a sink the host may replace. windows/src/pe sets it to
 // nr::pe::log, which appends to dlssnr-amd.log next to the module; anything that
 // does not set it keeps the terminal behaviour unchanged.
+#include <atomic>
 #include <chrono>
 #include <cstdarg>
+#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <utility>
@@ -28,6 +30,15 @@ using LogSink = void (*)(const char*);
 inline LogSink g_log_sink = nullptr;
 
 inline void set_log_sink(LogSink sink) { g_log_sink = sink; }
+
+// What the build running now is doing, for a host's UI (builds run one at a time). Stage: 0 none, 1 planning,
+// 2 reading the weights, 3 uploading them, 4 creating pipelines (pipes_done of pipes_total), 5 finishing.
+inline std::atomic<int> g_build_stage{0};
+inline std::atomic<uint32_t> g_build_pipes_done{0}, g_build_pipes_total{0};
+
+// A line about the host's memory (a 32-bit game's free address space), logged at a build's phases; null: none.
+using MemoryNote = std::string (*)();
+inline MemoryNote g_memory_note = nullptr;
 
 // One line, no trailing newline in `format`; the sink adds it.
 inline void logf(const char* format, ...) {

@@ -10,6 +10,7 @@
 #include <cstring>
 #include <initializer_list>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include <d3d12.h>
@@ -81,6 +82,37 @@ bool write_code(uint8_t* at, const void* bytes, size_t n) {
     return true;
 }
 
+// A signature written as hex bytes, "??" for any byte.
+struct Sig {
+    std::vector<uint8_t> bytes;
+    std::string mask;
+    explicit Sig(const char* text) {
+        for (const char* p = text; *p;) {
+            if (*p == ' ') { ++p; continue; }
+            if (p[0] == '?') { bytes.push_back(0); mask += '?'; p += 2; continue; }
+            bytes.push_back(static_cast<uint8_t>(std::strtoul(std::string(p, 2).c_str(), nullptr, 16)));
+            mask += 'x';
+            p += 2;
+        }
+    }
+};
+
+template <class Accept>
+int find_unique(const Module& m, const Sig& sig, Accept accept, uint8_t** hit) {
+    return find_unique(m, sig.bytes.data(), sig.mask.c_str(), sig.bytes.size(), accept, hit);
+}
+
+// Code bytes in fresh executable memory; null if it could not be allocated.
+uint8_t* place_code(const uint8_t* code, size_t n) {
+    auto* p = static_cast<uint8_t*>(VirtualAlloc(nullptr, n, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!p) return nullptr;
+    std::memcpy(p, code, n);
+    DWORD old = 0;
+    VirtualProtect(p, n, PAGE_EXECUTE_READ, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, n);
+    return p;
+}
+
 // ---- 1. The device-extension query (see the header) ----------------------------------------------
 void fix_extension_query(const Module& m) {
     // SupportedDeviceExtensions, OptiScaler-NR v0.8.4 (8802b2b4), MSVC x64:
@@ -136,8 +168,9 @@ void fix_extension_query(const Module& m) {
 // r14d/r13d = SyncInterval/Flags, r12b = willPresent, rdi = State::currentFG, [rbp+0x80] = cq.
 // Both the DXVK branch and the native block are matched byte for byte (the native block is where
 // ApplyToFinishedPicture's address and the FG field offsets come from), so any other build is left
-// alone.
-void fix_finished_picture(const Module& m) {
+// alone. v0.8.91 has its own layout below (finished_picture_0891). Each returns its number of matching
+// sites; the fix is applied only at exactly one.
+int finished_picture_084(const Module& m) {
     // test bl,bl (usesDxvk) / je native / the DXVK branch's first five instructions, then its
     // Present call: mov rax,[r15]; mov r9,[rbp-0x50]; mov r8d,r13d; mov edx,r14d; mov rcx,r15;
     // test r9,r9; jne +5; call [rax+0x40]
@@ -184,10 +217,7 @@ void fix_finished_picture(const Module& m) {
         apply = rel32_target(target + sizeof(native) - 4);
         return apply >= m.base && apply < m.base + m.image;
     }, &site);
-    if (hits != 1) {
-        log("[nr] OptiScaler fix (finished picture): %d matching sites in %ls, nothing changed", hits, m.name);
-        return;
-    }
+    if (hits != 1) return hits;
 
     uint8_t* const patch = site + 8;          // the DXVK branch's first instruction
     constexpr size_t kCopied = 16;            // five position-independent instructions
@@ -217,14 +247,14 @@ void fix_finished_picture(const Module& m) {
     if (n != sizeof(stub)) {
         log("[nr] OptiScaler fix (finished picture): stub is %zu bytes, expected %zu; nothing changed", n,
             sizeof(stub));
-        return;
+        return 1;
     }
 
     auto* code = static_cast<uint8_t*>(VirtualAlloc(nullptr, sizeof(stub), MEM_COMMIT | MEM_RESERVE,
                                                     PAGE_EXECUTE_READWRITE));
     if (!code) {
         log("[nr] OptiScaler fix (finished picture): VirtualAlloc failed (%lu)", GetLastError());
-        return;
+        return 1;
     }
     std::memcpy(code, stub, sizeof(stub));
     DWORD old = 0;
@@ -238,11 +268,122 @@ void fix_finished_picture(const Module& m) {
     jump[14] = jump[15] = 0x90;
     if (!write_code(patch, jump, sizeof(jump))) {
         log("[nr] OptiScaler fix (finished picture): VirtualProtect failed (%lu)", GetLastError());
-        return;
+        return 1;
     }
     log("[nr] OptiScaler fix: Finished Picture now runs on the DXVK present path (%ls+0x%llx, "
         "ApplyToFinishedPicture %ls+0x%llx)", m.name, static_cast<unsigned long long>(patch - m.base),
         m.name, static_cast<unsigned long long>(apply - m.base));
+    return 1;
+}
+
+// v0.8.91 (f45ccf3a). The native block now also skips the call when XeFG composes the game's own
+// picture (wrapped_swapchain.cpp, xeFgGamePicture):
+//
+//     if (cq && !xeFgGamePicture && (fg == nullptr || !fg->IsActive() || fg->IsPaused()))
+//         DlssNr::ApplyToFinishedPicture(pSwapChain, cq);
+//
+// and the DXVK branch counts a presented frame itself, after its Present. Registers at the branch:
+// r12 = the swapchain, r15d/r13d = SyncInterval/Flags, r14b = willPresent, rsi = State::currentFG,
+// [rbp-0x50] = hWnd, [rbp+0x78] = cq. The stub is the native block's D3D12 condition and call,
+// writing only rax, rcx and rdx, which the replaced instructions load again.
+int finished_picture_0891(const Module& m) {
+    // test bl,bl (usesDxvk) / je native / mov rax,[r12]; mov r9,[rbp-0x48]; mov r8d,r13d;
+    // mov edx,r15d; mov rcx,r12; test r9,r9; jne +5; call [rax+0x40]
+    static const Sig branch("84 DB 0F 84 ?? ?? ?? ?? 49 8B 04 24 4C 8B 4D B8 45 8B C5 41 8B D7 49 8B CC "
+                            "4D 85 C9 75 05 FF 50 40");
+    // The native block the je lands on: willPresent, TickFrozenCheck, xeFgGamePicture (State::Instance()
+    // at +9, +26, +82, +97, +111), cq, the inlined FG IsActive/IsPaused, mov rcx,r12; call
+    // ApplyToFinishedPicture.
+    static const Sig native(
+        "45 84 F6 0F 84 ?? ?? ?? ?? E8 ?? ?? ?? ?? 48 8B 98 98 09 00 00 48 85 DB 74 33 E8 ?? ?? ?? ?? "
+        "48 8B 88 A0 09 00 00 4C 8B 03 48 85 C9 74 16 48 8B 41 08 48 63 50 04 8B 94 0A 1C 02 00 00 85 D2 "
+        "0F 48 D7 EB 02 8B D7 48 8B CB 41 FF 50 40 48 85 F6 74 41 E8 ?? ?? ?? ?? 48 83 B8 C0 09 00 00 00 "
+        "74 32 E8 ?? ?? ?? ?? 83 B8 A4 00 00 00 03 75 24 E8 ?? ?? ?? ?? 83 B8 10 06 00 00 00 75 16 48 8B "
+        "06 48 8B CE FF 50 20 48 8B 7D B0 48 3B C7 75 08 B0 01 EB 06 48 8B 7D B0 32 C0 48 8B 55 78 48 85 "
+        "D2 74 49 84 C0 75 45 48 85 F6 74 33 48 8B 46 08 48 63 48 04 80 BC 31 25 02 00 00 00 75 0A 80 BC "
+        "31 18 02 00 00 00 74 17 48 8B 84 31 28 02 00 00 48 85 C0 74 17 48 3B 84 31 00 02 00 00 72 0D 49 "
+        "8B CC E8 ?? ?? ?? ??");
+    static const size_t kInstanceCalls[] = {9, 26, 82, 97, 111};
+
+    uint8_t* site = nullptr;
+    uint8_t* apply = nullptr;
+    uint8_t* instance = nullptr;
+    const int hits = find_unique(m, branch, [&](uint8_t* p) {
+        uint8_t* target = rel32_target(p + 4);
+        if (target < m.base || target + native.bytes.size() > m.base + m.image) return false;
+        if (!matches(target, native.bytes.data(), native.mask.c_str(), native.bytes.size())) return false;
+        uint8_t* const first = rel32_target(target + kInstanceCalls[0] + 1);
+        for (size_t at : kInstanceCalls)
+            if (rel32_target(target + at + 1) != first) return false;
+        apply = rel32_target(target + native.bytes.size() - 4);
+        instance = first;
+        return apply >= m.base && apply < m.base + m.image && instance >= m.base && instance < m.base + m.image;
+    }, &site);
+    if (hits != 1) return hits;
+
+    uint8_t* const patch = site + 8;          // the DXVK branch's first instruction
+    constexpr size_t kCopied = 17;            // five position-independent instructions
+    uint8_t* const back = patch + kCopied;    // test r9,r9
+
+    // Assembled from the listing on the right; the two movabs immediates at 27 and 145.
+    static const uint8_t kStub[] = {
+        0x45, 0x84, 0xF6, 0x0F, 0x84, 0x92, 0x00, 0x00, 0x00,              //   0 test r14b,r14b; jz skip
+        0x48, 0x83, 0x7D, 0x78, 0x00, 0x0F, 0x84, 0x87, 0x00, 0x00, 0x00,  //   9 cmp [rbp+0x78],0; jz skip
+        0x48, 0x85, 0xF6, 0x74, 0x37,                                      //  20 test rsi,rsi; jz fgcheck
+        0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xD0,                    //  25 call State::Instance
+        0x48, 0x83, 0xB8, 0xC0, 0x09, 0x00, 0x00, 0x00, 0x74, 0x21,        //  37 currentFGSwapchain
+        0x83, 0xB8, 0xA4, 0x00, 0x00, 0x00, 0x03, 0x75, 0x18,              //  47 activeFgOutput == XeFG
+        0x83, 0xB8, 0x10, 0x06, 0x00, 0x00, 0x00, 0x75, 0x0F,              //  56 no swapchain interop
+        0x48, 0x8B, 0x06, 0x48, 0x89, 0xF1, 0xFF, 0x50, 0x20,              //  65 fg->Hwnd()
+        0x48, 0x3B, 0x45, 0xB0, 0x74, 0x4B,                                //  74 == hWnd: skip
+        0x48, 0x85, 0xF6, 0x74, 0x33,                                      //  80 fgcheck: test rsi,rsi; jz do
+        0x48, 0x8B, 0x46, 0x08, 0x48, 0x63, 0x48, 0x04,                    //  85 fg's virtual-base offset
+        0x80, 0xBC, 0x31, 0x25, 0x02, 0x00, 0x00, 0x00, 0x75, 0x0A,        //  93 cmp; jne active
+        0x80, 0xBC, 0x31, 0x18, 0x02, 0x00, 0x00, 0x00, 0x74, 0x17,        // 103 cmp; je do
+        0x48, 0x8B, 0x84, 0x31, 0x28, 0x02, 0x00, 0x00,                    // 113 active:
+        0x48, 0x85, 0xC0, 0x74, 0x1D,                                      // 121 test rax,rax; jz skip
+        0x48, 0x3B, 0x84, 0x31, 0x00, 0x02, 0x00, 0x00, 0x72, 0x13,        // 126 cmp; jb skip
+        0x48, 0x8B, 0x55, 0x78, 0x4C, 0x89, 0xE1,                          // 136 do: rdx = cq; rcx = r12
+        0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xD0};                   // 143 call ApplyToFinishedPicture
+    static_assert(sizeof(kStub) == 155, "fp0891.s is 155 bytes up to skip");
+    uint8_t stub[sizeof(kStub) + kCopied + 14];
+    std::memcpy(stub, kStub, sizeof(kStub));
+    const uint64_t to_instance = reinterpret_cast<uint64_t>(instance), to_apply = reinterpret_cast<uint64_t>(apply),
+                   to_back = reinterpret_cast<uint64_t>(back);
+    std::memcpy(stub + 27, &to_instance, 8);
+    std::memcpy(stub + 145, &to_apply, 8);
+    std::memcpy(stub + sizeof(kStub), patch, kCopied);                  // skip: the replaced code
+    uint8_t* const tail = stub + sizeof(kStub) + kCopied;
+    tail[0] = 0xFF; tail[1] = 0x25; std::memset(tail + 2, 0, 4);        // jmp [rip+0]
+    std::memcpy(tail + 6, &to_back, 8);
+
+    uint8_t* const code = place_code(stub, sizeof(stub));
+    if (!code) {
+        log("[nr] OptiScaler fix (finished picture): VirtualAlloc failed (%lu)", GetLastError());
+        return 1;
+    }
+    uint8_t jump[kCopied];
+    jump[0] = 0xFF; jump[1] = 0x25; std::memset(jump + 2, 0, 4);        // jmp [rip+0]
+    const uint64_t to = reinterpret_cast<uint64_t>(code);
+    std::memcpy(jump + 6, &to, 8);
+    std::memset(jump + 14, 0x90, kCopied - 14);
+    if (!write_code(patch, jump, sizeof(jump))) {
+        log("[nr] OptiScaler fix (finished picture): VirtualProtect failed (%lu)", GetLastError());
+        return 1;
+    }
+    log("[nr] OptiScaler fix: Finished Picture now runs on the DXVK present path (%ls+0x%llx, "
+        "ApplyToFinishedPicture %ls+0x%llx)", m.name, static_cast<unsigned long long>(patch - m.base),
+        m.name, static_cast<unsigned long long>(apply - m.base));
+    return 1;
+}
+
+void fix_finished_picture(const Module& m) {
+    const int old_layout = finished_picture_084(m);
+    if (old_layout == 1) return;
+    const int new_layout = finished_picture_0891(m);
+    if (new_layout == 1) return;
+    log("[nr] OptiScaler fix (finished picture): %d/%d matching sites (v0.8.4/v0.8.91) in %ls, nothing changed",
+        old_layout, new_layout, m.name);
 }
 
 // ---- 3. Window-sized swapchains are not overlays ------------------------------------------------
@@ -420,21 +561,31 @@ void fix_autoexposure_hdr(const Module& m) {
         0x48, 0x8D, 0x15};
     static const char mask[] = "xxxxxxxxxxxxx" "xxxxxxxxxxxx" "xxxxxx" "xxxxxxxxx" "xxx";
     static_assert(sizeof(pat) == sizeof(mask) - 1, "pattern and mask lengths");
-    constexpr size_t kAnd = 31, kLen = 9;       // and cl,1 ; mov [rbp+0x8d],cl
+    // v0.8.91: the same sequence, flags at [rbp+0x180], ColourIsLinearHdr at [rbp+0x6d]:
+    // and cl,1 ; mov [rbp+0x6d],cl ; lea rdx,[rip+"DLSSD.Output"...]
+    static const Sig pat_0891("8B 8D 80 01 00 00 8B C1 C1 E8 03 24 01 88 45 61 8B C1 D1 E8 24 01 "
+                              "88 85 B4 00 00 00 80 E1 01 88 4D 6D 48 8D 15");
+    size_t kAnd = 31, kLen = 9;                 // and cl,1 ; mov [rbp+0x8d],cl
 
     uint8_t* hit = nullptr;
     const int hits = find_unique(m, pat, mask, sizeof(pat), [](uint8_t*) { return true; }, &hit);
     if (hits != 1) {
-        log("[nr] OptiScaler fix (AutoExposure HDR): %d matching sites in %ls, nothing changed", hits, m.name);
-        return;
+        const int hits_0891 = find_unique(m, pat_0891, [](uint8_t*) { return true; }, &hit);
+        if (hits_0891 != 1) {
+            log("[nr] OptiScaler fix (AutoExposure HDR): %d/%d matching sites (v0.8.4/v0.8.91) in %ls, nothing "
+                "changed", hits, hits_0891, m.name);
+            return;
+        }
+        kAnd = 28; kLen = 6;                    // and cl,1 ; mov [rbp+0x6d],cl
     }
     uint8_t* const at = hit + kAnd;
     uint8_t* const back = at + kLen;
-    uint8_t stub[17] = {0xF6, 0xC1, 0x41,                        // test cl,IsHDR|AutoExposure
-                        0x0F, 0x95, 0xC1,                        // setne cl
-                        0x88, 0x8D, 0x8D, 0x00, 0x00, 0x00,      // mov [rbp+0x8d],cl
-                        0xE9, 0, 0, 0, 0};                       // jmp back
-    auto* code = static_cast<uint8_t*>(alloc_near(m.base, m.image, sizeof(stub)));
+    // test cl,IsHDR|AutoExposure ; setne cl ; the site's own store of cl ; jmp back
+    uint8_t stub[17] = {0xF6, 0xC1, 0x41, 0x0F, 0x95, 0xC1};
+    const size_t store = kLen - 3, size = 6 + store + 5;
+    std::memcpy(stub + 6, at + 3, store);
+    stub[6 + store] = 0xE9;
+    auto* code = static_cast<uint8_t*>(alloc_near(m.base, m.image, size));
     int32_t to_stub = 0, to_back = 0;
     auto rel = [](uint8_t* from_end, uint8_t* to, int32_t* out) {
         const int64_t d = to - from_end;
@@ -442,19 +593,19 @@ void fix_autoexposure_hdr(const Module& m) {
         *out = static_cast<int32_t>(d);
         return true;
     };
-    if (!code || !rel(at + 5, code, &to_stub) || !rel(code + sizeof(stub), back, &to_back)) {
+    if (!code || !rel(at + 5, code, &to_stub) || !rel(code + size, back, &to_back)) {
         if (code) VirtualFree(code, 0, MEM_RELEASE);
         log("[nr] OptiScaler fix (AutoExposure HDR): no memory within reach of %ls, nothing changed", m.name);
         return;
     }
-    std::memcpy(stub + 13, &to_back, 4);
-    std::memcpy(code, stub, sizeof(stub));
+    std::memcpy(stub + size - 4, &to_back, 4);
+    std::memcpy(code, stub, size);
     DWORD old = 0;
-    VirtualProtect(code, sizeof(stub), PAGE_EXECUTE_READ, &old);
-    FlushInstructionCache(GetCurrentProcess(), code, sizeof(stub));
-    uint8_t jump[kLen] = {0xE9, 0, 0, 0, 0, 0x90, 0x90, 0x90, 0x90};
+    VirtualProtect(code, size, PAGE_EXECUTE_READ, &old);
+    FlushInstructionCache(GetCurrentProcess(), code, size);
+    uint8_t jump[9] = {0xE9, 0, 0, 0, 0, 0x90, 0x90, 0x90, 0x90};
     std::memcpy(jump + 1, &to_stub, 4);
-    if (!write_code(at, jump, sizeof(jump))) {
+    if (!write_code(at, jump, kLen)) {
         log("[nr] OptiScaler fix (AutoExposure HDR): VirtualProtect failed (%lu)", GetLastError());
         return;
     }
@@ -696,14 +847,24 @@ void fix_float_formats(const Module& m) {
         0xC6, 0x85, 0x8D, 0x00, 0x00, 0x00, 0x00};
     static const char mask[] = "xxxxxxxxxx" "xxxxxx????" "xxxx????" "xxx????" "xxxxx" "xxxxxxx";
     static_assert(sizeof(pat) == sizeof(mask) - 1, "pattern and mask lengths");
+    // v0.8.91: FormatCanHoldLinearHdr, the same table, now answering in al for
+    // `ColourIsLinearHdr &= ...`: ... jmp rcx ; keep: mov al,1 ; jmp store ; clear: xor al,al ;
+    // store: and [rbp+0x6d],al
+    static const Sig pat_0891("8B 48 20 FF C9 83 F9 19 77 22 48 63 C1 48 8D 15 ?? ?? ?? ?? 0F B6 84 02 ?? ?? ?? ?? "
+                              "8B 8C 82 ?? ?? ?? ?? 48 03 CA FF E1 B0 01 EB 02 32 C0 20 45 6D");
     constexpr size_t kCheck = 5, kLen = 5;      // cmp ecx,0x19 ; ja clear
-    constexpr size_t kClear = 40, kKeep = sizeof(pat);
+    size_t kClear = 40, kKeep = sizeof(pat);
 
     uint8_t* hit = nullptr;
     const int hits = find_unique(m, pat, mask, sizeof(pat), [](uint8_t*) { return true; }, &hit);
     if (hits != 1) {
-        log("[nr] OptiScaler fix (float formats): %d matching sites in %ls, nothing changed", hits, m.name);
-        return;
+        const int hits_0891 = find_unique(m, pat_0891, [](uint8_t*) { return true; }, &hit);
+        if (hits_0891 != 1) {
+            log("[nr] OptiScaler fix (float formats): %d/%d matching sites (v0.8.4/v0.8.91) in %ls, nothing "
+                "changed", hits, hits_0891, m.name);
+            return;
+        }
+        kClear = 44; kKeep = 40;                // xor al,al / mov al,1
     }
     uint8_t* const at = hit + kCheck;
     uint8_t* const back = at + kLen;

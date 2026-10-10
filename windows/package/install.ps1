@@ -1,7 +1,7 @@
 # DLSSNR-AMD Windows installer (run by install.bat)
 #
 #   install.bat                      a window asks for the game's exe, then for the route
-#   install.bat <game exe or its folder> [optiscaler|reshade|dx9|remove|logs] [-Dll <nvngx_dlssnr.dll or its zip>]
+#   install.bat <game exe or its folder> [optiscaler|reshade|dx9|vulkan|remove|logs] [-Dll <nvngx_dlssnr.dll or its zip>]
 #
 # The package carries no model: on the first install the user gives NVIDIA's nvngx_dlssnr.dll (310.8.0)
 # or a zip that contains it, and model-tools\dlssnr_extract_model.exe makes dlssnr.bin from it (it only
@@ -58,19 +58,20 @@ if (-not $Route) {
     Say ''
     Say "Game folder: $game"
     Say 'Choose a route:'
-    Say '  1) OptiScaler   the game has a DLSS, FSR or XeSS option (DX12 games only; for DX11 games choose 2)'
-    Say '  2) ReShade      other DX10/11/12 or Vulkan games'
+    Say '  1) OptiScaler   the game has a DLSS, FSR or XeSS option (DX11 / DX12)'
+    Say '  2) ReShade      other DX10/11/12 games'
     Say '  3) ReShade      old DX9 games'
-    Say '  4) Uninstall'
-    Say '  5) Collect logs when something goes wrong; the zip goes to the desktop'
-    $pick = Read-Host '1-5'
+    Say '  4) ReShade      Vulkan games'
+    Say '  5) Uninstall'
+    Say '  6) Collect logs when something goes wrong; the zip goes to the desktop'
+    $pick = Read-Host '1-6'
     switch ($pick) {
-        '1' { $Route = 'optiscaler' } '2' { $Route = 'reshade' } '3' { $Route = 'dx9' }
-        '4' { $Route = 'remove' } '5' { $Route = 'logs' }
+        '1' { $Route = 'optiscaler' } '2' { $Route = 'reshade' } '3' { $Route = 'dx9' } '4' { $Route = 'vulkan' }
+        '5' { $Route = 'remove' } '6' { $Route = 'logs' }
         default { Fail 'Invalid choice.' }
     }
 }
-if ('optiscaler', 'reshade', 'dx9', 'remove', 'logs' -notcontains $Route) { Fail "Unknown route: $Route" }
+if ('optiscaler', 'reshade', 'dx9', 'vulkan', 'remove', 'logs' -notcontains $Route) { Fail "Unknown route: $Route" }
 
 # ---- games under Program Files need administrator rights -------------------------------------
 if ($Route -ne 'logs') {
@@ -256,41 +257,52 @@ if (Test-Path -LiteralPath $manifest) { Say 'Found a previous installation, remo
 Set-Content -LiteralPath $manifest -Value "F $ManifestName" -Encoding UTF8
 Put-Tree (Join-Path $here 'dlssnr-amd') 'dlssnr-amd'
 if ($modelFrom -ne $model) { Copy-Item -LiteralPath $modelFrom -Destination (Join-Path $game 'dlssnr-amd\dlssnr.bin') -Force }
-Put-File (Join-Path $here 'vkd3d-proton\d3d12.dll') 'd3d12.dll'
-Put-File (Join-Path $here 'vkd3d-proton\d3d12core.dll') 'd3d12core.dll'
-Put-File (Join-Path $here 'dxvk\d3d11.dll') 'd3d11.dll'
-Put-File (Join-Path $here 'dxvk\d3d10core.dll') 'd3d10core.dll'
-# A Vulkan loader that never calls DXGI and finds ReShade's layer in the game folder (both routes need it).
-Put-File (Join-Path $here 'vulkan\vulkan-1.dll') 'vulkan-1.dll'
 $exeName = [System.IO.Path]::GetFileNameWithoutExtension($exe)
-Record-Logs @('dlssnr-amd.log', 'dlssnr-amd-crash.dmp', "${exeName}_dxgi.log", "${exeName}_d3d11.log", "${exeName}_d3d9.log",
-              'vkd3d-proton.cache', 'vkd3d-proton.cache.write')
+Record-Logs @('dlssnr-amd.log', 'dlssnr-amd-crash.dmp')
+
+# Other ReShade add-ons in the game folder (installed earlier) would load too; move them to the backup folder.
+function Move-OtherAddons {
+    foreach ($item in Get-ChildItem -LiteralPath $game -File | Where-Object { $_.Extension -in '.addon', '.addon64' }) {
+        if ($item.Name -ne 'dlssnr_amd.addon64') { Save-Existing $item.Name; Say "Moved another ReShade add-on aside: $($item.Name)" }
+    }
+}
+# ReShade's files. $asLayer: as a Vulkan layer (DX9 through DXVK, Vulkan games), found by the Vulkan loader in the
+# game folder; otherwise ReShade itself goes in as dxgi.dll (DX10/11/12 games).
+function Put-ReShade([bool]$asLayer) {
+    Move-OtherAddons
+    foreach ($item in Get-ChildItem -LiteralPath (Join-Path $here 'reshade')) {
+        if ($item.Name -eq 'ReShadePreset-d3d9.ini') { continue }
+        if (-not $asLayer -and ($item.Name -eq 'vk-override' -or $item.Name -eq 'ReShade64.dll')) { continue }
+        if ($item.PSIsContainer) { Put-Tree $item.FullName $item.Name } else { Put-File $item.FullName $item.Name }
+    }
+    if (-not $asLayer) { Put-File (Join-Path $here 'reshade\ReShade64.dll') 'dxgi.dll' }
+    Record-Logs @('ReShade.log')
+}
 
 if ($Route -eq 'optiscaler') {
+    # The game keeps the system's own D3D11/D3D12; NR runs on a Vulkan device of its own and shares the frame with it.
     foreach ($item in Get-ChildItem -LiteralPath (Join-Path $here 'optiscaler\game')) {
         if ($item.Name -eq 'OptiScaler.dll') { continue }
         if ($item.PSIsContainer) { Put-Tree $item.FullName $item.Name } else { Put-File $item.FullName $item.Name }
     }
-    # OptiScaler takes the name dxgi.dll and loads the "original" DXGI as dxgi-original.dll. That is our
-    # split DLL: the game's calls go to DXVK's dxgi (dxgi-dxvk.dll), the graphics driver's own presentation calls to the system DXGI.
     Put-File (Join-Path $here 'optiscaler\game\OptiScaler.dll') 'dxgi.dll'
-    Put-File (Join-Path $here 'dxvk\dxgi.dll') 'dxgi-dxvk.dll'
-    foreach ($f in 'dlssnr_core.dll', 'nvngx.dll_dlssnr.dll', 'nvngx_dlssnr.dll', 'dxgi-original.dll') { Put-File (Join-Path $here "optiscaler\$f") $f }
-    Record-Logs @('OptiScaler.log', 'dlssnr-amd.ini')
+    foreach ($f in 'dlssnr_core.dll', 'nvngx.dll_dlssnr.dll', 'nvngx_dlssnr.dll') { Put-File (Join-Path $here "optiscaler\$f") $f }
+    Record-Logs @('OptiScaler.log')
 
     $ini = Join-Path $game 'OptiScaler.ini'
     $wanted = [ordered]@{
         'DlssNr|Enabled'               = 'true'
         'Libraries|NvngxPath'          = (Join-Path $game 'dlssnr_core.dll')
-        # Auto picks FSR4 on RX 9000, which goes through the AMD driver's own D3D12 extension and does not work on vkd3d-proton.
-        'Upscalers|Dx12Upscaler'       = 'xess'
-        # With DXVK, overlays such as Steam's load while DXVK creates its Vulkan instance; OptiScaler then
-        # calls DXVK's CreateDXGIFactory again, DXVK's instance lock is not reentrant, and the game hangs (7 Days to Die).
-        # So this route blocks overlays (OptiScaler's own option); there is no Steam overlay in game.
-        'Hotfix|DisableOverlays'       = 'true'
-        # OptiScaler's own log is on while this is experimental (Debug level shows the names of blocked overlays).
+        # DX11 games: the upscaler runs on OptiScaler's D3D12 device (FSR, DX11 on 12), which is where NR runs.
+        'Upscalers|Dx11Upscaler'       = 'ffx_12'
+        # OptiScaler's own log is on while this is experimental.
         'Log|LogToFile'                = 'true'
         'Log|LogLevel'                 = '1'
+    }
+    # Rewritten when present, no note when absent: the white point follows the game's own exposure (v0.8.4's default;
+    # from v0.8.5 the default is a fixed white point).
+    $optional = [ordered]@{
+        'DlssNr|WhitePointSource'      = '1'
     }
     $lines = [System.IO.File]::ReadAllLines($ini)
     $section = $null; $seen = @{}
@@ -300,27 +312,36 @@ if ($Route -eq 'optiscaler') {
             $key = "$section|$($Matches[1])"
             if ($wanted.Contains($key) -and -not $seen.ContainsKey($key)) {
                 $lines[$i] = "$($Matches[1])=$($wanted[$key])"; $seen[$key] = 1
+            } elseif ($optional.Contains($key) -and -not $seen.ContainsKey($key)) {
+                $lines[$i] = "$($Matches[1])=$($optional[$key])"; $seen[$key] = 1
             }
         }
     }
     [System.IO.File]::WriteAllLines($ini, $lines)
     foreach ($key in $wanted.Keys) { if (-not $seen.ContainsKey($key)) { Say "Note: $key not found in OptiScaler.ini" } }
+} elseif ($Route -eq 'reshade') {
+    # DX10/11/12 games keep the system's own D3D; ReShade goes in as dxgi.dll.
+    Put-ReShade $false
 } else {
-    # Other ReShade add-ons in the game folder (installed earlier) would load too; move them to the backup folder.
-    foreach ($item in Get-ChildItem -LiteralPath $game -File | Where-Object { $_.Extension -in '.addon', '.addon64' }) {
-        if ($item.Name -ne 'dlssnr_amd.addon64') { Save-Existing $item.Name; Say "Moved another ReShade add-on aside: $($item.Name)" }
+    # DX9: DXVK moves the game to Vulkan, ReShade runs as a Vulkan layer. Vulkan games: only the ReShade layer.
+    # The Vulkan loader in the game folder never calls DXGI and finds ReShade's layer beside it.
+    Put-File (Join-Path $here 'vulkan\vulkan-1.dll') 'vulkan-1.dll'
+    if ($Route -eq 'dx9') {
+        Put-File (Join-Path $here 'dxvk\d3d9.dll') 'd3d9.dll'
+        Put-File (Join-Path $here 'dxvk\dxgi.dll') 'dxgi.dll'
+        Record-Logs @("${exeName}_dxgi.log", "${exeName}_d3d9.log")
     }
-    Put-File (Join-Path $here 'dxvk\dxgi.dll') 'dxgi.dll'
-    Put-File (Join-Path $here 'dxvk\d3d9.dll') 'd3d9.dll'
-    foreach ($item in Get-ChildItem -LiteralPath (Join-Path $here 'reshade')) {
-        if ($item.Name -eq 'ReShadePreset-d3d9.ini') { continue }
-        if ($item.PSIsContainer) { Put-Tree $item.FullName $item.Name } else { Put-File $item.FullName $item.Name }
-    }
+    Put-ReShade $true
     if ($Route -eq 'dx9') {
         Copy-Item -LiteralPath (Join-Path $here 'reshade\ReShadePreset-d3d9.ini') -Destination (Join-Path $game 'ReShadePreset.ini') -Force
     }
-    Record-Logs @('ReShade.log', 'dlssnr-amd.ini')
 }
+
+# dlssnr-amd.ini is written at install with every setting and its description (a reinstall writes the defaults
+# again). Uninstall deletes it.
+if ($Route -eq 'optiscaler') { $iniSrc = 'ini\dlssnr-amd-optiscaler.ini' } else { $iniSrc = 'ini\dlssnr-amd-addon.ini' }
+Copy-Item -LiteralPath (Join-Path $here $iniSrc) -Destination (Join-Path $game 'dlssnr-amd.ini') -Force
+Record-Logs @('dlssnr-amd.ini')
 
 Say ''
 Say "Installed into: $game"
@@ -332,5 +353,5 @@ if ($Route -eq 'optiscaler') {
     Say 'In the game, Home opens ReShade; the settings are on the Add-ons page, or edit dlssnr-amd.ini in the game folder.'
 }
 Say 'The first time NR runs in a game the network has to compile; it takes effect after about a minute. This happens once for each game.'
-Say 'Uninstall: run install.bat again and choose 4.'
+Say 'Uninstall: run install.bat again and choose 5.'
 Finish 0

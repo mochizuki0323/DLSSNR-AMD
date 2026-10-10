@@ -54,6 +54,8 @@ Measured facts worth knowing before changing kernels:
 - Releasing: `git tag v0.0.2 && git push origin v0.0.2`. CI (.github/workflows/packages.yml) builds
   the Linux packages and the Windows package and publishes a GitHub release. For a Linux-only release,
   set the repository variable `WINDOWS_PACKAGE` to `off` first (`gh variable set WINDOWS_PACKAGE --body off`).
+  A tag with `-win-` in it (`v0.0.4-win-preview`) is a Windows-only release: CI builds no Linux packages and
+  does not mark the release latest.
 
 ## Style
 

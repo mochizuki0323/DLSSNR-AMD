@@ -1,0 +1,21 @@
+#version 460
+// Model resolution: where the linear blit samples, for runtime_downscale.comp. Mode 0 writes each
+// texel's own column and row into a frame-sized RGBA32F probe; the runtime blits the probe down
+// exactly as it would blit the frame; mode 1 reads the result's first row (columns) and first column
+// (rows) as (first texel, fraction), the fraction being a multiple of 1/256.
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) writeonly buffer Taps { vec2 taps[]; };
+layout(set = 0, binding = 1, rgba32f) uniform writeonly image2D probe;
+layout(set = 0, binding = 2, rgba32f) uniform readonly image2D probed;
+layout(push_constant) uniform Push { uint w, h, mode; } pc;   // mode 0: the frame's extent; 1: the model's
+void main() {
+    const uint x = gl_GlobalInvocationID.x, y = gl_GlobalInvocationID.y;
+    if (pc.mode == 0u) {
+        if (x < pc.w && y < pc.h) imageStore(probe, ivec2(x, y), vec4(float(x), float(y), 0.0, 0.0));
+        return;
+    }
+    if (x >= pc.w + pc.h) return;
+    const float v = x < pc.w ? imageLoad(probed, ivec2(x, 0)).r : imageLoad(probed, ivec2(0, x - pc.w)).g;
+    const int q = int(round(v * 256.0));
+    taps[x] = vec2(float(q >> 8), float(q & 255) / 256.0);
+}

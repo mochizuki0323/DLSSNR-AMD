@@ -1,13 +1,20 @@
 #include "nr_pe_session.hpp"
+#include "nr_pe_bridge.hpp"
+#include "nr_pe_d3d12split.hpp"
 #include "nr_pe_log.hpp"
 #include "nr_pe_vkdevice.hpp"
+#include "nr_pipeline_binary.hpp"
 #include "nr_log.hpp"
 #include <windows.h>
+#include <d3d10.h>
+#include <d3d11_4.h>
+#include <dxgi.h>
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <set>
 #include <new>
 #include <string>
 #include <thread>
@@ -114,6 +121,25 @@ constexpr uint64_t kVramReserve = 1024ull << 20, kCommitReserve = 3072ull << 20;
 constexpr uint64_t kVramLow = 384ull << 20, kCommitLow = 1536ull << 20;
 
 }  // namespace
+
+// What the bridge needs to know about one D3D12 frame, whichever route handed it over.
+struct BridgeInputs {
+    ID3D12Resource* target{};
+    D3D12_RESOURCE_STATES target_state{};
+    // Where the colour is read from when it is not `target` itself (same format and extent).
+    ID3D12Resource* source{};
+    D3D12_RESOURCE_STATES source_state{};
+    ID3D12Resource* motion{};
+    D3D12_RESOURCE_STATES motion_state{};
+    ID3D12Resource* depth{};
+    D3D12_RESOURCE_STATES depth_state{};
+    Session::Subrect motion_subrect{}, depth_subrect{};
+    float motion_scale_x{1.0f}, motion_scale_y{1.0f};
+    bool depth_inverted{true};
+    bool reset{};
+    uint64_t feature{};
+    bool linear{};   // the colour is scene-referred linear light (encoded by the runtime)
+};
 
 struct Session::Impl {
     std::string root;
@@ -225,6 +251,17 @@ struct Session::Impl {
     // The background build. Everything the thread needs is copied in; it hands
     // back either a runtime or an error under `build_lock`, and the render
     // thread adopts whichever on its next call.
+    // Evicted networks wait here before they are destroyed. run_after and run_present record the network into
+    // the game's own command list (vkd3d-proton's command buffer), which the game submits and the GPU runs frames
+    // later: a network that served the previous frame can still be read by the GPU when its replacement is
+    // adopted (the [Int4Mixed] switch, a resolution change). Destroying it then frees memory under in-flight work
+    // and hangs the GPU. Freed after kRetireCalls more evaluations and kRetireTime, far past any frame in flight.
+    struct Evicted { std::unique_ptr<Runtime> runtime; uint64_t call; std::chrono::steady_clock::time_point at; };
+    std::vector<Evicted> retired;
+    uint64_t calls{};   // ensure_runtime calls (one per evaluation)
+    static constexpr uint64_t kRetireCalls = 16;
+    static constexpr std::chrono::seconds kRetireTime{1};
+    void free_retired();
     std::thread build_thread;
     std::mutex build_lock;
     bool building{}, build_done{}, build_linear{}, build_prep{};
@@ -233,6 +270,7 @@ struct Session::Impl {
     VkFormat build_format{VK_FORMAT_UNDEFINED};
     std::unique_ptr<Runtime> built;
     std::string build_error;
+    std::chrono::steady_clock::time_point build_started{};
     double build_seconds{};
     // A build that ran out of *host* memory is a moment, not a verdict: the one
     // that failed did so 168 ms after a fullscreen transition, while DXVK was
@@ -266,7 +304,69 @@ struct Session::Impl {
     bool ensure_d3d12_device(ID3D12Device* device);
     // The Vulkan device underneath is vkd3d-proton's, which always enables bufferDeviceAddress.
     bool vkd3d_device = false;
-    bool fits_in_memory(uint32_t w, uint32_t h);
+
+    // ---- the bridge (nr_pe_bridge.hpp): the native D3D runtime, our own Vulkan device ----
+    enum class Mode { Unknown, Interop, Bridge };
+    Mode mode{Mode::Unknown};
+    bridge::Device* bdev{};
+    // The frame's colour (in place), motion and depth as both APIs see them. The D3D side of each is
+    // ours; the game's resources are copied in and the result copied back.
+    bridge::Image shared_colour, shared_motion, shared_depth;
+    bridge::DepthCopyD3D12 depth12;
+    bridge::DepthCopyD3D11 depth11;
+    bool depth_warned{};
+    // Shared images replaced by a resize, freed once nothing can still be using them.
+    struct RetiredImage {
+        bridge::Image image;
+        uint64_t after{};
+        uint64_t mark{~0ull};   // the hand-over queue's position once no job of ours could use it
+    };
+    // Runtimes whose recorded frames were dropped (bridge::Device::on_drop, any thread): their temporal
+    // state is reset before their next recording. Shared, so a drop after the session is gone is harmless.
+    struct Drops {
+        std::mutex m;
+        std::set<const void*> runtimes;
+    };
+    std::shared_ptr<Drops> drops = std::make_shared<Drops>();
+    // A bridge job on the current runtime, with the drop hook set and any pending drop applied.
+    bridge::Job* begin_job(std::string* why);
+    // The ReShade D3D12 route's queue: its own lists and their fence belong to that queue alone.
+    ID3D12CommandQueue* own_queue{};
+    std::vector<RetiredImage> retired_images;
+    uint64_t bridge_runs{};
+    bool decide_mode(bool interop_present);
+    bool ensure_bridge(const LUID& luid);
+    bool ensure_shared(bridge::Image& image, uint32_t w, uint32_t h, DXGI_FORMAT format, ID3D12Device* d12,
+                       ID3D11Device* d11, const char* what, ID3D10Device* d10 = nullptr);
+    void sweep_retired_images();
+    // The network over the shared images, recorded on our device. Null (with `status`) when it could not.
+    bridge::Job* record_bridge_job(const EngineFrame& base, bool motion, bool depth, const Controls& controls);
+    // The ReShade D3D12 route's own command lists on the game's queue, two per frame.
+    struct OwnList {
+        ID3D12CommandAllocator* allocator{};
+        ID3D12GraphicsCommandList* list{};
+        uint64_t done{};
+    };
+    std::vector<OwnList> own_lists;
+    ID3D12Fence* own_lists_fence{};
+    uint64_t own_lists_value{};
+    ID3D12GraphicsCommandList* next_own_list(ID3D12Device* device);
+    void release_bridge();
+    void record_copy_in(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* colour,
+                        D3D12_RESOURCE_STATES colour_state, ID3D12Resource* motion, D3D12_RESOURCE_STATES motion_state,
+                        ID3D12Resource* depth, D3D12_RESOURCE_STATES depth_state);
+    // One set of shared images per extent in use (features before and after the upscale alternate).
+    struct SharedSet {
+        bridge::Image colour, motion, depth;
+    };
+    std::vector<SharedSet> parked_sets;
+    void select_shared_set(uint32_t w, uint32_t h, DXGI_FORMAT fmt, const void* device);
+    void record_copy_out(ID3D12GraphicsCommandList* list, ID3D12Resource* target, D3D12_RESOURCE_STATES target_state);
+    bridge::Job* bridge_prepare_d3d12(ID3D12Device* device, ID3D12GraphicsCommandList* copy_list,
+                                      const BridgeInputs& in, const Controls& controls,
+                                      const std::function<bool()>& before_copy);
+    bool bridge_d3d11(ID3D11Device* device, const D3D11Frame& frame, const Controls& controls);
+    bool fits_in_memory(uint32_t w, uint32_t h, bool quiet = false);   // quiet: no log, no status
     // Session::Impl::memory_guard. False while the network is held off.
     bool memory_guard();
     struct Retired {
@@ -284,8 +384,9 @@ struct Session::Impl {
         for (const auto& e : cache) if (e.width == w && e.height == h) return true;
         return false;
     }
-    // Free least-recently-used entries until the card can hold another network
-    // at this extent. False means it cannot hold one even with the cache empty.
+    // True when the card can hold another network at this extent. Otherwise the
+    // least recently used entry is evicted (one per call) and false is returned:
+    // the frame passes through and the build is asked for again later.
     bool make_room(uint32_t w, uint32_t h);
     void drop(size_t index, const char* why = "to make room");
     // Feature ids, handed out by Session::create_feature. Monotonic, never
@@ -494,7 +595,7 @@ static uint64_t arena_bytes_per_pixel() {
     return e && *e && std::atoi(e) == 0 ? 520 : 200;
 }
 
-bool Session::Impl::fits_in_memory(uint32_t w, uint32_t h) {
+bool Session::Impl::fits_in_memory(uint32_t w, uint32_t h, bool quiet) {
     // The arena is sized from the padded model extent (Model Resolution), the
     // frame-sized images from the frame; plus weights and scratch.
     const auto model = [&](uint32_t v) {
@@ -511,6 +612,7 @@ bool Session::Impl::fits_in_memory(uint32_t w, uint32_t h) {
     } else if (m.commit_limit && need + kCommitReserve > m.commit_free) {
         short_of = "system memory (RAM + page file)"; have = m.commit_free; reserve = kCommitReserve;
     }
+    if (quiet) return !short_of;
     if (short_of) {
         char message[320];
         std::snprintf(message, sizeof message,
@@ -542,7 +644,8 @@ bool Session::Impl::memory_guard() {
     // Retired networks, destroyed once they are surely idle.
     for (auto it = retiring.begin(); it != retiring.end();) {
         if (it->frames_left) --it->frames_left;
-        if (!it->frames_left && now >= it->not_before) {
+        // On the bridge, not while a recorded or running frame of ours still uses it.
+        if (!it->frames_left && now >= it->not_before && !(bdev && bdev->busy(it->entry.runtime.get()))) {
             wait_for_own_cmd();
             it = retiring.erase(it);
         } else {
@@ -602,23 +705,38 @@ void Session::Impl::drop(size_t index, const char* why) {
     if (runtime == e.runtime.get()) { runtime = nullptr; width = height = 0; }
     // Nothing of ours may still be reading it. On the paths that submit for
     // themselves this waits on our own fence; on the paths that record into the
-    // game's command list there is nothing of ours to wait for, and eviction
-    // only happens on a frame where the caller has already been told to pass
-    // through - which is exactly when it is safe.
+    // game's command list the game's frames in flight may still hold it, so it
+    // is not destroyed here but retired (see Retired).
     wait_for_own_cmd();
+    retired.push_back({std::move(e.runtime), calls, std::chrono::steady_clock::now()});
     cache.erase(cache.begin() + long(index));
 }
 
-bool Session::Impl::make_room(uint32_t w, uint32_t h) {
-    while (true) {
-        if (fits_in_memory(w, h)) return true;
-        if (cache.empty()) return false;
-        size_t oldest = 0;
-        for (size_t i = 1; i < cache.size(); ++i)
-            if (cache[i].used < cache[oldest].used) oldest = i;
-        drop(oldest);
+void Session::Impl::free_retired() {
+    const auto now = std::chrono::steady_clock::now();
+    for (size_t i = retired.size(); i-- > 0;) {
+        if (calls - retired[i].call < kRetireCalls || now - retired[i].at < kRetireTime) continue;
+        // On the bridge a recorded frame runs when its command list does, which the game decides: not
+        // while one that uses this network is recorded and not yet run, or still running.
+        if (bdev && bdev->busy(retired[i].runtime.get())) continue;
+        retired.erase(retired.begin() + long(i));
+        log("[nr] evicted network freed");
     }
 }
+
+bool Session::Impl::make_room(uint32_t w, uint32_t h) {
+    if (fits_in_memory(w, h)) return true;
+    if (cache.empty()) return false;
+    size_t oldest = 0;
+    for (size_t i = 1; i < cache.size(); ++i)
+        if (cache[i].used < cache[oldest].used) oldest = i;
+    // One at a time: an evicted network keeps its memory until it is freed (see Retired), and the build is asked
+    // for again once it has been.
+    drop(oldest);
+    status = "freeing the least recently used network to make room";
+    return false;
+}
+
 
 bool Session::Impl::ensure_runtime(const Controls& controls, uint32_t w, uint32_t h, VkFormat format,
                                    bool want_linear) {
@@ -638,6 +756,8 @@ bool Session::Impl::ensure_runtime(const Controls& controls, uint32_t w, uint32_
 
 bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32_t h, VkFormat format,
                                     bool want_linear) {
+    ++calls;
+    if (!retired.empty()) free_retired();
     if (controls.preprocess.active() && !prep_want) {
         prep_want = true;
         log("[nr] preprocess asked for: networks are rebuilt able to run it (once)");
@@ -718,6 +838,13 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
         }
         retry_at = {};
     }
+    // An evicted network still holds its memory until it is freed. If the next one does not fit beside it, wait
+    // for that rather than push out another: the switch keeps the running network serving, anything else passes
+    // through.
+    if (!retired.empty() && !fits_in_memory(w, h, true)) {
+        status = "freeing the previous network before building another";
+        return false;
+    }
     // Checked before anything is allocated, and not treated as a hard failure:
     // a smaller extent may well fit later, and a game changing resolution is
     // exactly when that happens. Cached networks at other extents are given up
@@ -744,7 +871,8 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
     // and waits for it; the game is submitting to the same underlying VkQueue,
     // so each of those submits takes the queue lock (below).
     host.queue = access.queue; host.queue_family = access.family;
-    host.buffer_device_address = vkd3d_device || vkdevice::network_features_added(handles.device);
+    host.buffer_device_address = vkd3d_device || mode == Mode::Bridge ||
+                                 vkdevice::network_features_added(handles.device);
     // Off the render thread. Building reads the weights, creates every pipeline
     // and allocates the arena, and doing that inside the upscaler's call froze
     // the game for the duration every time the feature was first turned on. The
@@ -752,39 +880,58 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
     // from the render thread; the game keeps rendering unenhanced frames until
     // the build is adopted above.
     const QueueAccess access_copy = access;
+    build_started = std::chrono::steady_clock::now();
+    nr::g_build_stage = 1; nr::g_build_pipes_done = 0; nr::g_build_pipes_total = 0;
     building = true; build_w = w; build_h = h; build_format = format; build_linear = want_linear;
     build_scale = model_scale; build_passes = max_passes_want; build_prep = prep_want;
     status = "building the network in the background; frames pass through until it is ready";
     VkPhysicalDeviceProperties gpu{};
     vkGetPhysicalDeviceProperties(handles.physical, &gpu);
-    log("[nr] building the network at %ux%u (model scale %.2f) on %s in the background%s", w, h, model_scale,
+    log("[nr] building the network at %ux%u (model scale %.2f) on %s in the background%s%s", w, h, model_scale,
         gpu.deviceName,
-        want_linear ? " (linear-light colour: encoding with a white point, see dlssnr-amd.ini white_point)" : "");
+        want_linear ? " (linear-light colour: encoding with a white point, see dlssnr-amd.ini white_point)" : "",
+        nr::binary::directory().empty() ? "" : ", ACO's machine code ([Network] ACO Mode)");
+    {
+        static std::string said;
+        const std::string why = nr::binary::disabled_why();
+        if (!why.empty() && why != said) { said = why; log("[nr] [Network] ACO Mode is off for this run: %s", why.c_str()); }
+    }
     build_thread = std::thread([this, host, config, temporal, access_copy] {
         const auto t0 = std::chrono::steady_clock::now();
         std::unique_ptr<Runtime> made;
         std::string error;
         bool oom = false;
+        // The queue lock around each submit of the build, not around the
+        // build: held for the whole of it, the pipeline compile (14-24 s
+        // cold at 4K under AMD's Windows compiler) blocked vkd3d's own
+        // submissions and presents on the shared queue, and the game froze
+        // for as long. **Quiet**: this is not the render thread, and the
+        // flush half of the other lock drives DXVK's immediate context,
+        // which that thread owns. See QueueAccess::lock_quiet.
+        HostDevice locked = host;
+        locked.queue_lock = access_copy.lock_quiet;
+        locked.queue_unlock = access_copy.unlock_quiet;
         try {
-            // The queue lock around each submit of the build, not around the
-            // build: held for the whole of it, the pipeline compile (14-24 s
-            // cold at 4K under AMD's Windows compiler) blocked vkd3d's own
-            // submissions and presents on the shared queue, and the game froze
-            // for as long. **Quiet**: this is not the render thread, and the
-            // flush half of the other lock drives DXVK's immediate context,
-            // which that thread owns. See QueueAccess::lock_quiet.
-            HostDevice locked = host;
-            locked.queue_lock = access_copy.lock_quiet;
-            locked.queue_unlock = access_copy.unlock_quiet;
-            made = std::make_unique<Runtime>(locked, config, ControlMaskConfig{}, temporal);
-        } catch (const std::bad_alloc&) {
+            try {
+                made = std::make_unique<Runtime>(locked, config, ControlMaskConfig{}, temporal);
+            } catch (const std::exception& e) {
+                // An ACO network that does not build ([Network] ACO Mode): off for the rest of the run, and
+                // this network built again with the driver's own compiler.
+                if (nr::binary::directory().empty() || dynamic_cast<const std::bad_alloc*>(&e)) throw;
+                nr::binary::disable(std::string("the ACO network did not build (") + e.what() + ")");
+                log("[nr] [Network] ACO Mode: %s; building with the driver's compiler", nr::binary::disabled_why().c_str());
+                made = std::make_unique<Runtime>(locked, config, ControlMaskConfig{}, temporal);
+            }
+        } catch (const std::bad_alloc& e) {
             // Caught apart from everything else because it is the one failure
-            // that is about the *host* and is worth retrying. `what()` here is
-            // the useless string "std::bad_alloc"; what a reader needs is how
-            // much address space was left, and the build's own log lines above
-            // say what it had just asked for.
+            // that is about the *host* and is worth retrying: operator new, or
+            // Vulkan's own host-memory / mapping failures (nrvk::HostMemoryError).
+            // For a plain bad_alloc `what()` is the useless "std::bad_alloc";
+            // what a reader needs is how much address space was left, and the
+            // build's own log lines above say what it had just asked for.
             oom = true;
-            error = "neural rendering unavailable: out of host memory. " + address_space_report();
+            error = std::string("neural rendering unavailable: out of host memory (") + e.what() + "). " +
+                    address_space_report();
         } catch (const std::exception& e) {
             error = std::string("neural rendering unavailable: ") + e.what();
         }
@@ -1003,13 +1150,443 @@ bool Session::Impl::ensure_d3d12_device(ID3D12Device* device) {
     return true;
 }
 
+// ---- the bridge -------------------------------------------------------------------------------------
+
+bool Session::Impl::decide_mode(bool interop_present) {
+    if (mode != Mode::Unknown) return mode == Mode::Bridge;
+    static const bool forced = [] {
+        char v[4] = {};
+        const DWORD n = GetEnvironmentVariableA("NR_BRIDGE", v, sizeof v);
+        return n > 0 && n < sizeof v && v[0] == '1';
+    }();
+    mode = interop_present && !forced ? Mode::Interop : Mode::Bridge;
+    if (mode == Mode::Bridge)
+        log("[nr] %s: the network runs on a Vulkan device of its own beside the game's D3D device",
+            interop_present ? "NR_BRIDGE=1" : "native D3D runtime");
+    return mode == Mode::Bridge;
+}
+
+bool Session::Impl::ensure_bridge(const LUID& luid) {
+    if (bdev) return true;
+    std::string why;
+    bdev = bridge::Device::get(luid, &why);
+    if (!bdev) {
+        status = "neural rendering unavailable: " + why;
+        failed = true;
+        return false;
+    }
+    handles = bdev->handles();
+    access.queue = bdev->queue();
+    access.family = bdev->family();
+    // Our queue is ours: the only other submitter is the build thread's weight upload.
+    bridge::Device* d = bdev;
+    access.lock = access.lock_quiet = [d] { d->lock(); };
+    access.unlock = access.unlock_quiet = [d] { d->unlock(); };
+    return true;
+}
+
+bool Session::Impl::ensure_shared(bridge::Image& image, uint32_t w, uint32_t h, DXGI_FORMAT format,
+                                  ID3D12Device* d12, ID3D11Device* d11, const char* what, ID3D10Device* d10) {
+    const void* device = d12 ? static_cast<const void*>(d12) : d11 ? static_cast<const void*>(d11) : d10;
+    if (image.matches(w, h, format, device)) return true;
+    if (image) {
+        retired_images.push_back({image, bridge_runs + 16});
+        image = bridge::Image{};
+    }
+    std::string why;
+    const bool ok = d12 ? bdev->create_d3d12(d12, w, h, format, &image, &why)
+                  : d11 ? bdev->create_d3d11(d11, w, h, format, &image, &why)
+                        : bdev->create_d3d10(d10, w, h, format, &image, &why);
+    if (!ok) {
+        status = std::string("the shared ") + what + " image: " + why;
+        thread_local std::string said;
+        if (said != status) { said = status; log("[nr] bridge: %s", status.c_str()); }
+        return false;
+    }
+    log("[nr] bridge: shared %s image %ux%u, DXGI format %u, VkFormat %u%s", what, w, h, unsigned(format),
+        unsigned(image.format), image.storage ? "" : " (no storage use)");
+    return true;
+}
+
+void Session::Impl::sweep_retired_images() {
+    for (auto it = retired_images.begin(); it != retired_images.end();) {
+        // Not before 16 more hand-overs, not while a job of ours (recorded or running) uses it, and a
+        // D3D12 one not before its queue has got past the frames that copied out of it.
+        if (bridge_runs < it->after || bdev->busy(it->image.image)) { ++it; continue; }
+        if (it->mark == ~0ull) { it->mark = bdev->hand_over_mark(); ++it; continue; }
+        ID3D12Resource* r12 = nullptr;
+        const bool d3d12 = it->image.d3d && SUCCEEDED(it->image.d3d->QueryInterface(IID_PPV_ARGS(&r12))) && r12;
+        if (r12) r12->Release();
+        if (d3d12 && !bdev->hand_over_passed(it->mark)) { ++it; continue; }
+        bdev->destroy(it->image);
+        it = retired_images.erase(it);
+    }
+}
+
+namespace {
+
+void add_transition(std::vector<D3D12_RESOURCE_BARRIER>& v, ID3D12Resource* r, D3D12_RESOURCE_STATES from,
+                    D3D12_RESOURCE_STATES to) {
+    if (!r || from == to) return;
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = r;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = from;
+    b.Transition.StateAfter = to;
+    v.push_back(b);
+}
+
+void flush_barriers(ID3D12GraphicsCommandList* list, std::vector<D3D12_RESOURCE_BARRIER>& v) {
+    if (!v.empty()) list->ResourceBarrier(UINT(v.size()), v.data());
+    v.clear();
+}
+
+ID3D12Resource* d3d12_of(const bridge::Image& image) { return static_cast<ID3D12Resource*>(image.d3d); }
+
+ColourFrame bridge_frame(const bridge::Image& image) {
+    ColourFrame f{};
+    f.image = image.image;
+    f.format = image.format;
+    f.width = image.width;
+    f.height = image.height;
+    f.before = f.after = VK_IMAGE_LAYOUT_GENERAL;
+    f.usage = image.usage;
+    return f;
+}
+
+}  // namespace
+
+ID3D12GraphicsCommandList* Session::Impl::next_own_list(ID3D12Device* device) {
+    if (!own_lists_fence &&
+        FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&own_lists_fence))))
+        return nullptr;
+    const uint64_t completed = own_lists_fence->GetCompletedValue();
+    if (completed == UINT64_MAX) { if (bdev) bdev->lost("the game's D3D12 device was removed"); return nullptr; }
+    OwnList* pick = nullptr;
+    for (auto& l : own_lists)
+        if (l.done <= completed && l.done < ~0ull - 1) { pick = &l; break; }
+    if (!pick && own_lists.size() >= 8) {
+        // Every one is still on the GPU: wait for the oldest, at most a second.
+        OwnList* oldest = &own_lists[0];
+        for (auto& l : own_lists) if (l.done < oldest->done) oldest = &l;
+        HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (event && SUCCEEDED(own_lists_fence->SetEventOnCompletion(oldest->done, event)))
+            WaitForSingleObject(event, 1000);
+        if (event) CloseHandle(event);
+        if (own_lists_fence->GetCompletedValue() < oldest->done) return nullptr;
+        pick = oldest;
+    }
+    if (pick) {
+        if (FAILED(pick->allocator->Reset()) || FAILED(pick->list->Reset(pick->allocator, nullptr))) return nullptr;
+    } else {
+        OwnList l;
+        if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&l.allocator))) ||
+            FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, l.allocator, nullptr,
+                                             IID_PPV_ARGS(&l.list)))) {
+            if (l.allocator) l.allocator->Release();
+            return nullptr;
+        }
+        own_lists.push_back(l);
+        pick = &own_lists.back();
+    }
+    pick->done = ~0ull;   // recording; given its value when executed
+    return pick->list;
+}
+
+void Session::Impl::release_bridge() {
+    if (!bdev) return;
+    bdev->wait_idle();
+    if (own_lists_fence) {
+        HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (event && SUCCEEDED(own_lists_fence->SetEventOnCompletion(own_lists_value, event)))
+            WaitForSingleObject(event, 1000);
+        if (event) CloseHandle(event);
+    }
+    for (auto& l : own_lists) {
+        if (l.list) l.list->Release();
+        if (l.allocator) l.allocator->Release();
+    }
+    own_lists.clear();
+    if (own_lists_fence) { own_lists_fence->Release(); own_lists_fence = nullptr; }
+    // The D3D sides are released once the game's queue is past what it was given so far (bury): a
+    // command list recorded with our copies can still be executed after the session is gone.
+    bdev->bury(shared_colour);
+    bdev->bury(shared_motion);
+    bdev->bury(shared_depth);
+    for (auto& r : retired_images) bdev->bury(r.image);
+    retired_images.clear();
+    for (auto& p : parked_sets) { bdev->bury(p.colour); bdev->bury(p.motion); bdev->bury(p.depth); }
+    parked_sets.clear();
+    if (own_queue) { own_queue->Release(); own_queue = nullptr; }
+}
+
+bridge::Job* Session::Impl::begin_job(std::string* why) {
+    {
+        std::lock_guard<std::mutex> guard(drops->m);
+        if (drops->runtimes.erase(runtime)) {
+            runtime->drop_history();
+            log("[nr] bridge: a recorded frame was not run; the network's history starts again");
+        }
+    }
+    bridge::Job* job = bdev->begin(why, runtime);
+    if (job) {
+        auto box = drops;
+        const void* owner = runtime;
+        bdev->on_drop(job, [box, owner] {
+            std::lock_guard<std::mutex> guard(box->m);
+            box->runtimes.insert(owner);
+        });
+    }
+    return job;
+}
+
+bridge::Job* Session::Impl::record_bridge_job(const EngineFrame& base, bool motion, bool depth,
+                                              const Controls& controls) {
+    (void)depth;
+    std::string why;
+    bridge::Job* job = begin_job(&why);
+    if (!job) {
+        status = "neural rendering skipped: " + why;
+        return nullptr;
+    }
+    std::vector<const bridge::Image*> images{&shared_colour};
+    if (base.motion.image) images.push_back(&shared_motion);
+    if (base.depth.image) images.push_back(&shared_depth);
+    bdev->acquire(job, images);
+    try {
+        const VkCommandBuffer cmd = bdev->command_buffer(job);
+        if (motion) runtime->record_engine(cmd, base, controls);
+        else runtime->record(cmd, base.colour, controls);
+    } catch (const std::exception& e) {
+        bdev->abort(job);
+        status = std::string("neural rendering failed: ") + e.what();
+        failed = true;
+        log("[nr] %s", status.c_str());
+        return nullptr;
+    }
+    if (!bdev->end(job, &why)) {
+        status = why;
+        return nullptr;
+    }
+    return job;
+}
+
+// The game's frame, motion and depth into the shared images, recorded into `list`. Each resource goes
+// back to the state it came in; the shared ones end in COMMON, as every hand-over to the other API
+// wants. `depth` comes back false when the depth buffer could not be read.
+void Session::Impl::record_copy_in(ID3D12Device* device, ID3D12GraphicsCommandList* list,
+                                   ID3D12Resource* colour, D3D12_RESOURCE_STATES colour_state, ID3D12Resource* motion,
+                                   D3D12_RESOURCE_STATES motion_state, ID3D12Resource* depth,
+                                   D3D12_RESOURCE_STATES depth_state) {
+    auto& s = *this;
+    constexpr auto kCommon = D3D12_RESOURCE_STATE_COMMON;
+    constexpr auto kSrc = D3D12_RESOURCE_STATE_COPY_SOURCE, kDst = D3D12_RESOURCE_STATE_COPY_DEST;
+    constexpr auto kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    constexpr auto kUav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    ID3D12Resource* sc = d3d12_of(s.shared_colour);
+    ID3D12Resource* sm = motion ? d3d12_of(s.shared_motion) : nullptr;
+    ID3D12Resource* sd = depth ? d3d12_of(s.shared_depth) : nullptr;
+    // A read state gains the compute-read bit; a write state (or none) is left for compute reads alone,
+    // since read and write bits cannot be combined.
+    const auto kWrites = D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_UNORDERED_ACCESS |
+                             D3D12_RESOURCE_STATE_DEPTH_WRITE | D3D12_RESOURCE_STATE_STREAM_OUT |
+                             D3D12_RESOURCE_STATE_COPY_DEST | D3D12_RESOURCE_STATE_RESOLVE_DEST;
+    const D3D12_RESOURCE_STATES depth_read =
+        (depth_state & kRead) ? depth_state
+        : (depth_state & kWrites) || depth_state == D3D12_RESOURCE_STATE_COMMON ? kRead
+                                                                                : (depth_state | kRead);
+    std::vector<D3D12_RESOURCE_BARRIER> b;
+    add_transition(b, colour, colour_state, kSrc);
+    add_transition(b, sc, kCommon, kDst);
+    if (motion) { add_transition(b, motion, motion_state, kSrc); add_transition(b, sm, kCommon, kDst); }
+    if (depth) { add_transition(b, depth, depth_state, depth_read); add_transition(b, sd, kCommon, kUav); }
+    flush_barriers(list, b);
+    list->CopyResource(sc, colour);
+    if (motion) list->CopyResource(sm, motion);
+    if (depth) {
+        std::string why;
+        // Checked by bridge_prepare_d3d12 already (depth12.ready); a failure here would only leave the
+        // depth image as it was.
+        if (!s.depth12.record(device, list, depth, sd, &why)) log("[nr] bridge: depth copy failed: %s", why.c_str());
+    }
+    add_transition(b, colour, kSrc, colour_state);
+    add_transition(b, sc, kDst, kCommon);
+    if (motion) { add_transition(b, motion, kSrc, motion_state); add_transition(b, sm, kDst, kCommon); }
+    if (depth) { add_transition(b, depth, depth_read, depth_state); add_transition(b, sd, kUav, kCommon); }
+    flush_barriers(list, b);
+}
+
+// The enhanced frame back into the game's resource.
+void Session::Impl::record_copy_out(ID3D12GraphicsCommandList* list, ID3D12Resource* target,
+                                    D3D12_RESOURCE_STATES target_state) {
+    auto& s = *this;
+    ID3D12Resource* sc = d3d12_of(s.shared_colour);
+    std::vector<D3D12_RESOURCE_BARRIER> b;
+    add_transition(b, sc, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    add_transition(b, target, target_state, D3D12_RESOURCE_STATE_COPY_DEST);
+    flush_barriers(list, b);
+    list->CopyResource(target, sc);
+    add_transition(b, sc, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    add_transition(b, target, D3D12_RESOURCE_STATE_COPY_DEST, target_state);
+    flush_barriers(list, b);
+}
+
+// Everything up to and including the network's recording: the runtime, the shared images, the copy
+// into them (into `copy_list`) and the job. Null with `status` set when the frame passes through.
+namespace {
+// A resource the bridge copies whole with CopyResource into its one-mip, one-layer, single-sample
+// shared image.
+bool plain_2d(const D3D12_RESOURCE_DESC& d) {
+    return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.MipLevels == 1 && d.DepthOrArraySize == 1 &&
+           d.SampleDesc.Count == 1;
+}
+}  // namespace
+
+void Session::Impl::select_shared_set(uint32_t w, uint32_t h, DXGI_FORMAT fmt, const void* device) {
+    if (!shared_colour || shared_colour.matches(w, h, fmt, device)) return;
+    // Features at two extents (before and after the upscale) take turns: each keeps its own images
+    // rather than recreating them on every switch.
+    size_t found = parked_sets.size();
+    for (size_t i = 0; i < parked_sets.size(); ++i)
+        if (parked_sets[i].colour.matches(w, h, fmt, device)) found = i;
+    SharedSet current{shared_colour, shared_motion, shared_depth};
+    shared_colour = bridge::Image{}; shared_motion = bridge::Image{}; shared_depth = bridge::Image{};
+    if (found < parked_sets.size()) {
+        shared_colour = parked_sets[found].colour;
+        shared_motion = parked_sets[found].motion;
+        shared_depth = parked_sets[found].depth;
+        parked_sets.erase(parked_sets.begin() + long(found));
+    }
+    parked_sets.push_back(current);
+    if (parked_sets.size() > 3) {
+        for (bridge::Image* i : {&parked_sets[0].colour, &parked_sets[0].motion, &parked_sets[0].depth})
+            if (*i) retired_images.push_back({*i, bridge_runs + 16});
+        parked_sets.erase(parked_sets.begin());
+    }
+}
+
+bridge::Job* Session::Impl::bridge_prepare_d3d12(ID3D12Device* device, ID3D12GraphicsCommandList* copy_list,
+                                                 const BridgeInputs& in, const Controls& controls,
+                                                 const std::function<bool()>& before_copy) {
+    auto& s = *this;
+    ++s.bridge_runs;
+    s.sweep_retired_images();
+    const D3D12_RESOURCE_DESC desc = in.target->GetDesc();
+    const DXGI_FORMAT fmt = bridge::shared_format(desc.Format);
+    const VkFormat vk = fmt == DXGI_FORMAT_UNKNOWN ? VK_FORMAT_UNDEFINED : vulkan_colour_format_of(fmt);
+    if (vk == VK_FORMAT_UNDEFINED) {
+        s.status = "the frame's DXGI format " + std::to_string(unsigned(desc.Format)) + " is not one the bridge carries";
+        return nullptr;
+    }
+    if (!plain_2d(desc)) {
+        s.status = "the frame is not a single-sample 2D texture with one mip and one layer";
+        return nullptr;
+    }
+    if (in.source) {
+        const D3D12_RESOURCE_DESC sd = in.source->GetDesc();
+        if (bridge::shared_format(sd.Format) != fmt || sd.Width != desc.Width || sd.Height != desc.Height ||
+            !plain_2d(sd)) {
+            s.status = "the input is not the output's twin";
+            return nullptr;
+        }
+    }
+    const uint32_t w = uint32_t(desc.Width), h = desc.Height;
+    if (!s.ensure_runtime(controls, w, h, vk, in.linear && Session::Impl::is_linear_format(vk))) return nullptr;
+    s.select_shared_set(w, h, fmt, device);
+    if (!s.ensure_shared(s.shared_colour, w, h, fmt, device, nullptr, "colour")) return nullptr;
+    // Everything that decides what is copied is settled here, before anything is recorded anywhere.
+    bool motion = false, depth = false;
+    if (in.motion) {
+        const D3D12_RESOURCE_DESC md = in.motion->GetDesc();
+        const DXGI_FORMAT mf = bridge::shared_format(md.Format);
+        motion = mf != DXGI_FORMAT_UNKNOWN && plain_2d(md) &&
+                 s.ensure_shared(s.shared_motion, uint32_t(md.Width), md.Height, mf, device, nullptr, "motion");
+    }
+    if (in.depth) {
+        const D3D12_RESOURCE_DESC dd = in.depth->GetDesc();
+        std::string why;
+        if (dd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || dd.DepthOrArraySize != 1 || dd.SampleDesc.Count != 1)
+            why = "the depth buffer is not a single-sample 2D texture";
+        else if (dd.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)
+            why = "the depth buffer denies shader reads";
+        else if (bridge::depth_view_format(dd.Format) == DXGI_FORMAT_UNKNOWN)
+            why = "the depth buffer's DXGI format " + std::to_string(unsigned(dd.Format)) + " cannot be read";
+        else if (!s.depth12.ready(device, &why)) {
+        } else if (!s.ensure_shared(s.shared_depth, uint32_t(dd.Width), dd.Height, DXGI_FORMAT_R32_FLOAT, device,
+                                    nullptr, "depth")) {
+            why = s.status;
+        } else if (!s.shared_depth.storage) {
+            why = "the shared depth image cannot be written by a shader";
+        } else {
+            depth = true;
+        }
+        if (!depth && !s.depth_warned) {
+            s.depth_warned = true;
+            log("[nr] bridge: running without depth: %s", why.c_str());
+        }
+    }
+    s.status.clear();
+    // Everything that can still turn the frame away is asked before the network is recorded: a recording
+    // advances the network's history, and one that never runs leaves that history unwritten.
+    if (before_copy && !before_copy()) return nullptr;
+
+    // The network first: a frame that cannot be recorded leaves the game's list untouched.
+    EngineFrame engine{};
+    engine.colour = bridge_frame(s.shared_colour);
+    engine.feature = in.feature;
+    engine.reset = in.reset;
+    engine.motion_scale_x = in.motion_scale_x;
+    engine.motion_scale_y = in.motion_scale_y;
+    engine.depth_inverted = in.depth_inverted;
+    if (motion) {
+        engine.motion = bridge_frame(s.shared_motion);
+        engine.motion_texture_width = engine.motion.width;
+        engine.motion_texture_height = engine.motion.height;
+        apply_guide_subrect(&engine.motion, in.motion_subrect, "motion-vector", &engine.motion_x, &engine.motion_y);
+    }
+    if (depth) {
+        engine.depth = bridge_frame(s.shared_depth);
+        apply_guide_subrect(&engine.depth, in.depth_subrect, "depth", &engine.depth_x, &engine.depth_y);
+    }
+    bridge::Job* job = s.record_bridge_job(engine, motion, depth, controls);
+    if (!job) return nullptr;
+    record_copy_in(device, copy_list, in.source ? in.source : in.target, in.source ? in.source_state : in.target_state,
+                   motion ? in.motion : nullptr, in.motion_state, depth ? in.depth : nullptr, in.depth_state);
+    return job;
+}
+
 Session::Session(std::string root) : impl_(std::make_unique<Impl>()) {
     impl_->root = root.empty() ? std::string(nr::pe::module_folder()) : std::move(root);
     // The runtime's own diagnostics - the build's phase breakdown above all -
     // went to a stdout a game does not have. Send them to the same file
     // everything else here writes to.
     nr::set_log_sink([](const char* line) { log("%s", line); });
+    // 32-bit: the build logs the free address space at each phase.
+    if (sizeof(void*) == 4) nr::g_memory_note = [] { return address_space_report(); };
     log("[nr] session root %s", impl_->root.c_str());
+    // NR_INPUT_CHECK=1 (NR_INPUT_CHECK_DEFAULT for a build that has it on without asking):
+    // score what the game hands the network and what it gets back; pictures in
+    // dlssnr-amd-check\ beside the log. NR_INPUT_CHECK_PICTURES=n sets how many captures
+    // are written as pictures (default 4).
+    static const bool input_check = [] {
+#ifdef NR_INPUT_CHECK_DEFAULT
+        bool on = NR_INPUT_CHECK_DEFAULT != 0;
+#else
+        bool on = false;
+#endif
+        char v[16] = {};
+        if (GetEnvironmentVariableA("NR_INPUT_CHECK", v, sizeof v) > 0) on = v[0] == '1';
+        if (!on) return false;
+        int pictures = 4;
+        if (GetEnvironmentVariableA("NR_INPUT_CHECK_PICTURES", v, sizeof v) > 0) pictures = std::atoi(v);
+        std::string folder = nr::pe::module_folder();
+        folder += folder.empty() ? "dlssnr-amd-check" : "\\dlssnr-amd-check";
+        if (!CreateDirectoryA(folder.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) folder.clear();
+        nr::set_input_check(true, folder, pictures);
+        return true;
+    }();
+    (void)input_check;
 }
 
 void Session::set_white_point(float v) {
@@ -1042,12 +1619,22 @@ Session::~Session() {
     // A build still running owns nothing the session is about to destroy, but
     // it will hand back a runtime that must be destroyed too: wait for it.
     if (impl_->build_thread.joinable()) impl_->build_thread.join();
+    // On the bridge: frames recorded for these networks and not yet run are given up (a command list
+    // that runs later skips them), and our queue may still be running frames that use them.
+    if (impl_->bdev) {
+        for (auto& e : impl_->cache) impl_->bdev->cancel(e.runtime.get());
+        for (auto& e : impl_->retiring) impl_->bdev->cancel(e.entry.runtime.get());
+        for (auto& e : impl_->retired) impl_->bdev->cancel(e.runtime.get());
+        impl_->bdev->wait_idle();
+    }
     impl_->built.reset();
     impl_->runtime = nullptr;
     impl_->cache.clear();
     impl_->retiring.clear();
+    impl_->retired.clear();
     impl_->release_output();
     impl_->release_invalidator();
+    impl_->release_bridge();
     impl_->release_vk_output();
     if (impl_->pool) vkDestroyCommandPool(impl_->handles.device, impl_->pool, nullptr);
     if (impl_->owned_queue) impl_->owned_queue->Release();
@@ -1063,6 +1650,7 @@ Session::~Session() {
 void Session::wait_idle() {
     impl_->wait_for_own_cmd();
     for (auto& slot : impl_->slots) impl_->wait_slot(slot);
+    if (impl_->bdev) impl_->bdev->wait_idle();
 }
 
 const std::string& Session::status() const { return impl_->status; }
@@ -1074,6 +1662,28 @@ bool Session::failed() const { return impl_->failed; }
 // rebuild the old one is still the one paying for the picture on screen.
 float Session::gpu_ms() const {
     return impl_->runtime ? impl_->runtime->average_gpu_ms() : 0.0f;
+}
+
+float Session::network_ms() const {
+    return impl_->runtime ? impl_->runtime->average_network_ms() : 0.0f;
+}
+
+Session::State Session::state() const {
+    State s;
+    const auto& m = *impl_;
+    s.running = m.runtime != nullptr;
+    if (m.runtime) { s.model_w = m.runtime->model_width(); s.model_h = m.runtime->model_height(); }
+    s.building = m.building;
+    if (m.building) {
+        s.building_seconds = std::chrono::duration<float>(std::chrono::steady_clock::now() - m.build_started).count();
+        s.stage = nr::g_build_stage;
+        s.pipes_done = nr::g_build_pipes_done; s.pipes_total = nr::g_build_pipes_total;
+    }
+    return s;
+}
+
+void Session::set_int4(bool on) {
+    (void)on;
 }
 
 std::string Session::vram_line() const {
@@ -1211,10 +1821,64 @@ ID3D12Resource* Session::run(ID3D12Device* device, ID3D12GraphicsCommandList* li
 
 bool Session::run_after(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                         ID3D12Resource* output, D3D12_RESOURCE_STATES output_state,
-                        const EngineResources& resources, const Controls& controls) {
+                        const EngineResources& resources, const Controls& controls,
+                        ID3D12Resource* input, D3D12_RESOURCE_STATES input_state) {
     auto& s = *impl_;
     if (s.failed || !device || !list || !output) return false;
     s.status.clear();
+    if (bridged(device)) {
+        // Native D3D12: the list is cut here (nr_pe_d3d12split.hpp) and the network runs between the
+        // halves on our own device.
+        if (!s.ensure_bridge(device->GetAdapterLuid())) return false;
+        BridgeInputs in{};
+        in.target = output; in.target_state = output_state;
+        // A separate input: copied into the shared image instead of the output, which then needs no
+        // seed copy (the answer is copied into it either way).
+        in.source = input; in.source_state = input_state;
+        in.motion = resources.motion; in.motion_state = resources.motion_state;
+        in.depth = resources.depth; in.depth_state = resources.depth_state;
+        in.motion_subrect = resources.motion_subrect; in.depth_subrect = resources.depth_subrect;
+        in.motion_scale_x = resources.motion_scale_x; in.motion_scale_y = resources.motion_scale_y;
+        in.depth_inverted = resources.depth_inverted;
+        in.reset = resources.reset;
+        in.feature = resources.feature;
+        in.linear = !resources.colour_encoded;
+        std::shared_ptr<split::Snapshot> state;
+        std::string why;
+        // The game's state as the evaluate found it, before anything of ours is recorded.
+        const auto before_copy = [&] {
+            if (!split::prepare(list, &why)) { s.status = "the command list cannot be cut yet: " + why; return false; }
+            state = split::snapshot(list);
+            if (!state) { s.status = "the command list's state is not known"; return false; }
+            return true;
+        };
+        bridge::Job* job = s.bridge_prepare_d3d12(device, list, in, controls, before_copy);
+        if (!job) return false;
+        bridge::Device* d = s.bdev;
+        const uint64_t gen = d->generation(job);
+        split::Job between;
+        between.run = [d, job, gen](ID3D12CommandQueue* queue) { d->run_between(queue, job, gen); };
+        between.discard = [d, job, gen] { d->discard(job, gen); };
+        if (!split::cut(list, std::move(between), state, &why)) {
+            // The copy into the shared images is in the list; the bindings the depth copy made are
+            // taken back, and the frame is left alone.
+            d->discard(job, gen);
+            split::restore(list, state);
+            s.status = "the command list could not be cut: " + why;
+            thread_local std::string said;
+            if (said != s.status) { said = s.status; log("[nr] bridge: %s", s.status.c_str()); }
+            return false;
+        }
+        // Recorded through the list, so into the continuation, after our work.
+        s.record_copy_out(list, output, output_state);
+        static bool first = true;
+        if (first) {
+            first = false;
+            log("[nr] bridge: first frame cut at the evaluate and handed to the network (%ux%u)",
+                unsigned(output->GetDesc().Width), output->GetDesc().Height);
+        }
+        return true;
+    }
     if (!s.ensure_d3d12_device(device)) return false;
     const VkCommandBuffer cmd = command_buffer(list);
     if (!cmd) { s.status = "the command list exposes no Vulkan handle"; s.failed = true; return false; }
@@ -1235,6 +1899,21 @@ bool Session::run_after(ID3D12Device* device, ID3D12GraphicsCommandList* list,
 
     EngineFrame engine{};
     engine.colour = frame;
+    // A separate input: the network samples it in place and stores its answer
+    // into the output, so the output needs no copy of the colour first. Only
+    // the engine path with the model applied; anything else is the caller's
+    // seed copy and the in-place run.
+    if (input) {
+        if (!resources.motion || !s.runtime || !s.runtime->takes_target(controls)) return false;
+        const auto source = colour_handle(device, input, input_state);
+        if (!source.usable() || source.format != target.format || source.width != target.width ||
+            source.height != target.height || !(source.usage & VK_IMAGE_USAGE_SAMPLED_BIT))
+            return false;
+        engine.target = frame;
+        engine.colour.image = source.image;
+        engine.colour.before = engine.colour.after = source.layout;
+        engine.colour.usage = source.usage;
+    }
     engine.feature = resources.feature;
     engine.reset = resources.reset;
     engine.motion_scale_x = resources.motion_scale_x;
@@ -1249,6 +1928,7 @@ bool Session::run_after(ID3D12Device* device, ID3D12GraphicsCommandList* list,
     if (resources.depth &&
         fill(&engine.depth, resource_handle(device, resources.depth, resources.depth_state)))
         apply_guide_subrect(&engine.depth, resources.depth_subrect, "depth", &engine.depth_x, &engine.depth_y);
+    if (input && !motion_vk) return false;   // the plain path works in place: the caller seeds
     // Full memory barriers on either side of the network, because the caller's
     // barriers are vkd3d's translation of D3D12 resource states and know
     // nothing about ours. Its "UAV -> SRV" on the output waits for compute
@@ -1297,6 +1977,405 @@ bool Session::run_after(ID3D12Device* device, ID3D12GraphicsCommandList* list,
     return true;
 }
 
+bool Session::bridged(ID3D12Device* device) {
+    auto& s = *impl_;
+    if (s.mode != Impl::Mode::Unknown) return s.mode == Impl::Mode::Bridge;
+    return s.decide_mode(device_handles(device).valid());
+}
+
+bool Session::run_d3d12_queue(const D3D12QueueFrame& f, const Controls& controls) {
+    auto& s = *impl_;
+    if (s.failed || !f.device || !f.queue || !f.target) return false;
+    s.status.clear();
+    if (!bridged(f.device)) { s.status = "the queue-level hand-over is for the native D3D12 runtime"; return false; }
+    if (!s.ensure_bridge(f.device->GetAdapterLuid())) return false;
+    // Our lists and their completion fence follow one queue's order: frames on any other queue pass through.
+    if (!s.own_queue) { s.own_queue = f.queue; f.queue->AddRef(); }
+    if (f.queue != s.own_queue) { s.status = "the frame is on another D3D12 queue than the network's"; return false; }
+    ID3D12GraphicsCommandList* in_list = s.next_own_list(f.device);
+    if (!in_list) { s.status = "no command list of our own on the game's device"; return false; }
+    BridgeInputs in{};
+    in.target = f.target; in.target_state = f.target_state;
+    in.motion = f.motion; in.motion_state = f.motion_state;
+    in.depth = f.depth; in.depth_state = f.depth_state;
+    in.motion_scale_x = f.motion_scale_x; in.motion_scale_y = f.motion_scale_y;
+    in.depth_inverted = f.depth_inverted;
+    in.reset = f.reset;
+    in.linear = f.linear_hdr;
+    // The list's slot is handed back as finished at once if the frame passes through.
+    const auto give_back = [&](ID3D12GraphicsCommandList* l) {
+        l->Close();
+        for (auto& o : s.own_lists) if (o.list == l) o.done = 0;
+    };
+    bridge::Job* job = s.bridge_prepare_d3d12(f.device, in_list, in, controls, nullptr);
+    if (!job) { give_back(in_list); return false; }
+    const uint64_t gen = s.bdev->generation(job);
+    ID3D12GraphicsCommandList* out_list = s.next_own_list(f.device);
+    if (!out_list) {
+        s.bdev->discard(job, gen);
+        give_back(in_list);
+        s.status = "no command list of our own on the game's device";
+        return false;
+    }
+    s.record_copy_out(out_list, f.target, f.target_state);
+    const HRESULT closed_in = in_list->Close(), closed_out = out_list->Close();
+    if (FAILED(closed_in) || FAILED(closed_out)) {
+        s.bdev->discard(job, gen);
+        for (auto& o : s.own_lists) if (o.list == in_list || o.list == out_list) o.done = 0;
+        s.status = "our command lists would not close";
+        return false;
+    }
+    // Everything recorded before us goes to the queue first; then the copy in, the hand-over to our
+    // queue and back, the copy out (only when the network ran: otherwise the frame stays as it was).
+    if (f.flush) f.flush();
+    ID3D12CommandList* first = in_list;
+    f.queue->ExecuteCommandLists(1, &first);
+    const bool ran = s.bdev->run_between(f.queue, job, gen);
+    if (ran) {
+        ID3D12CommandList* second = out_list;
+        f.queue->ExecuteCommandLists(1, &second);
+    }
+    // The in-list copy is on the queue whatever happened: the slots are free once this value is reached.
+    if (FAILED(f.queue->Signal(s.own_lists_fence, s.own_lists_value + 1))) {
+        // No completion mark: these two lists are never handed out again.
+        for (auto& o : s.own_lists) if (o.list == in_list || o.list == out_list) o.done = ~0ull - 1;
+        s.status = "the D3D12 queue refused a signal";
+        return false;
+    }
+    ++s.own_lists_value;
+    for (auto& o : s.own_lists)
+        if (o.list == in_list || o.list == out_list) o.done = ran || o.list == in_list ? s.own_lists_value : 0;
+    if (!ran) { s.status = "the network did not run on this frame"; return false; }
+    static bool first_frame = true;
+    if (first_frame) { first_frame = false; log("[nr] bridge: first D3D12 frame handed over at queue level"); }
+    return true;
+}
+
+namespace {
+LUID adapter_luid(IUnknown* device) {
+    LUID luid{};
+    IDXGIDevice* dxgi = nullptr;
+    IDXGIAdapter* adapter = nullptr;
+    DXGI_ADAPTER_DESC ad{};
+    if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dxgi))) && dxgi && SUCCEEDED(dxgi->GetAdapter(&adapter)) &&
+        adapter && SUCCEEDED(adapter->GetDesc(&ad)))
+        luid = ad.AdapterLuid;
+    if (adapter) adapter->Release();
+    if (dxgi) dxgi->Release();
+    return luid;
+}
+
+// The keyed mutexes of the shared images, as one transaction: either every one is taken at `key`, or
+// none is (those already taken are handed back at `key`).
+enum class Keyed { Ok, Timeout, Abandoned, Failed };
+Keyed acquire_all(const std::vector<const bridge::Image*>& images, UINT64 key, DWORD ms) {
+    std::vector<IDXGIKeyedMutex*> taken;
+    Keyed result = Keyed::Ok;
+    for (const bridge::Image* i : images) {
+        IDXGIKeyedMutex* km = nullptr;
+        if (FAILED(i->d3d->QueryInterface(IID_PPV_ARGS(&km))) || !km) { result = Keyed::Failed; break; }
+        const HRESULT hr = km->AcquireSync(key, ms);
+        if (hr == S_OK) { taken.push_back(km); continue; }
+        km->Release();
+        result = hr == static_cast<HRESULT>(WAIT_ABANDONED) ? Keyed::Abandoned
+               : hr == static_cast<HRESULT>(WAIT_TIMEOUT) ? Keyed::Timeout : Keyed::Failed;
+        break;
+    }
+    for (IDXGIKeyedMutex* km : taken) {
+        if (result != Keyed::Ok) km->ReleaseSync(key);
+        km->Release();
+    }
+    return result;
+}
+// Every image handed over at `key`. False if any refused; the ones that refused are still ours (at the
+// key they were acquired with), the others are at `key`.
+bool release_all(const std::vector<const bridge::Image*>& images, UINT64 key, std::vector<bool>* released = nullptr) {
+    bool ok = true;
+    if (released) released->assign(images.size(), false);
+    for (size_t n = 0; n < images.size(); ++n) {
+        IDXGIKeyedMutex* km = nullptr;
+        if (FAILED(images[n]->d3d->QueryInterface(IID_PPV_ARGS(&km))) || !km) { ok = false; continue; }
+        const bool done = SUCCEEDED(km->ReleaseSync(key));
+        km->Release();
+        if (released) (*released)[n] = done;
+        ok = ok && done;
+    }
+    return ok;
+}
+const char* keyed_text(Keyed k) {
+    return k == Keyed::Timeout ? "timed out" : k == Keyed::Abandoned ? "was abandoned" : "failed";
+}
+}  // namespace
+
+bool Session::run_d3d10(const D3D11Frame& frame, const Controls& controls) {
+    auto& s = *impl_;
+    if (s.failed || !frame.device || !frame.target) return false;
+    s.status.clear();
+    ID3D10Device* device = nullptr;
+    if (FAILED(frame.device->QueryInterface(IID_PPV_ARGS(&device))) || !device) {
+        s.status = "the device is not a D3D10 device";
+        return false;
+    }
+    struct Release { IUnknown* p; ~Release() { if (p) p->Release(); } } hold_device{device};
+    s.decide_mode(false);
+    if (!s.ensure_bridge(adapter_luid(device))) return false;
+    if (!s.bdev->keyed_mutex()) {
+        s.status = "neural rendering unavailable in D3D10: the driver has no VK_KHR_win32_keyed_mutex";
+        s.failed = true;
+        log("[nr] %s", s.status.c_str());
+        return false;
+    }
+    ++s.bridge_runs;
+    s.sweep_retired_images();
+    ID3D10Texture2D* target = nullptr;
+    if (FAILED(frame.target->QueryInterface(IID_PPV_ARGS(&target))) || !target) {
+        s.status = "the D3D10 frame is not a 2D texture";
+        return false;
+    }
+    Release hold_target{target};
+    D3D10_TEXTURE2D_DESC td{};
+    target->GetDesc(&td);
+    const DXGI_FORMAT fmt = bridge::shared_format(td.Format);
+    const VkFormat vk = fmt == DXGI_FORMAT_UNKNOWN ? VK_FORMAT_UNDEFINED : vulkan_colour_format_of(fmt);
+    if (vk == VK_FORMAT_UNDEFINED || td.SampleDesc.Count != 1 || td.MipLevels != 1 || td.ArraySize != 1) {
+        s.status = "the frame's DXGI format " + std::to_string(unsigned(td.Format)) + " is not one the bridge carries";
+        return false;
+    }
+    const bool linear = (frame.upscaler_input || frame.linear_hdr) && !frame.estimate_motion &&
+                        Impl::is_linear_format(vk);
+    if (!s.ensure_runtime(controls, td.Width, td.Height, vk, linear) ||
+        !s.ensure_shared(s.shared_colour, td.Width, td.Height, fmt, nullptr, nullptr, "colour", device))
+        return false;
+    ID3D10Texture2D* motion = nullptr;
+    if (frame.motion && SUCCEEDED(frame.motion->QueryInterface(IID_PPV_ARGS(&motion))) && motion) {
+        D3D10_TEXTURE2D_DESC md{};
+        motion->GetDesc(&md);
+        const DXGI_FORMAT mf = bridge::shared_format(md.Format);
+        if (mf == DXGI_FORMAT_UNKNOWN || md.SampleDesc.Count != 1 || md.MipLevels != 1 || md.ArraySize != 1 ||
+            !s.ensure_shared(s.shared_motion, md.Width, md.Height, mf, nullptr, nullptr, "motion", device)) {
+            motion->Release();
+            motion = nullptr;
+        }
+    }
+    Release hold_motion{motion};
+    if (frame.depth && !s.depth_warned) {
+        s.depth_warned = true;
+        log("[nr] bridge: D3D10 has no compute shaders; the pass runs without depth");
+    }
+    s.status.clear();
+
+    // The network first, so a frame that cannot be recorded leaves the game's texture alone.
+    EngineFrame engine{};
+    engine.colour = bridge_frame(s.shared_colour);
+    engine.reset = frame.reset;
+    engine.motion_scale_x = frame.motion_scale_x;
+    engine.motion_scale_y = frame.motion_scale_y;
+    engine.depth_inverted = frame.depth_inverted;
+    if (motion) engine.motion = bridge_frame(s.shared_motion);
+    bridge::Job* job = nullptr;
+    if (frame.estimate_motion && !motion) {
+        std::string why;
+        job = s.begin_job(&why);
+        if (!job) { s.status = "neural rendering skipped: " + why; return false; }
+        s.bdev->acquire(job, {&s.shared_colour});
+        try {
+            TemporalFrame temporal{};
+            temporal.reset = frame.reset;
+            s.runtime->record_temporal(s.bdev->command_buffer(job), engine.colour, controls, temporal);
+        } catch (const std::exception& e) {
+            s.bdev->abort(job);
+            s.status = std::string("neural rendering failed: ") + e.what();
+            s.failed = true;
+            log("[nr] %s", s.status.c_str());
+            return false;
+        }
+        if (!s.bdev->end(job, &why)) { s.status = why; return false; }
+    } else {
+        job = s.record_bridge_job(engine, motion != nullptr, false, controls);
+        if (!job) return false;
+    }
+    const uint64_t gen = s.bdev->generation(job);
+
+    std::vector<const bridge::Image*> images{&s.shared_colour};
+    if (motion) images.push_back(&s.shared_motion);
+    // Key 0: ours on the D3D10 side. A key that was abandoned (a holder died) is not used again.
+    const Keyed took = acquire_all(images, 0, 1000);
+    if (took != Keyed::Ok) {
+        s.bdev->discard(job, gen);
+        s.status = std::string("the shared textures' keyed mutex ") + keyed_text(took);
+        if (took != Keyed::Timeout) { s.failed = true; log("[nr] bridge: %s", s.status.c_str()); }
+        return false;
+    }
+    // Our copies must not be skipped by a predicate the game left set.
+    ID3D10Predicate* predicate = nullptr;
+    BOOL predicate_value = FALSE;
+    device->GetPredication(&predicate, &predicate_value);
+    if (predicate) device->SetPredication(nullptr, FALSE);
+    const auto restore_predicate = [&] {
+        if (predicate) { device->SetPredication(predicate, predicate_value); predicate->Release(); predicate = nullptr; }
+    };
+    device->CopyResource(static_cast<ID3D10Resource*>(s.shared_colour.d3d), target);
+    if (motion) device->CopyResource(static_cast<ID3D10Resource*>(s.shared_motion.d3d), motion);
+    // Handed to our queue at key 1; a texture that refused stays ours at 0, the rest are taken back to 0.
+    std::vector<bool> released;
+    if (!release_all(images, 1, &released)) {
+        s.bdev->discard(job, gen);
+        std::vector<const bridge::Image*> back;
+        for (size_t n = 0; n < images.size(); ++n) if (released[n]) back.push_back(images[n]);
+        const bool recovered = acquire_all(back, 1, 1000) == Keyed::Ok && release_all(images, 0);
+        restore_predicate();
+        s.status = "a shared texture's keyed mutex could not be handed over";
+        if (!recovered) s.failed = true;
+        log("[nr] bridge: %s%s", s.status.c_str(), recovered ? "" : "; the textures are lost to us");
+        return false;
+    }
+    device->Flush();
+    if (!s.bdev->submit_keyed(job, gen, images, 1, 2)) {
+        // Take the textures back at the key we left them at, so the next frame starts from 0.
+        const bool recovered = acquire_all(images, 1, 1000) == Keyed::Ok && release_all(images, 0);
+        restore_predicate();
+        s.status = "the bridge submit failed";
+        if (!recovered) { s.failed = true; log("[nr] bridge: %s; the shared textures are lost to us", s.status.c_str()); }
+        return false;
+    }
+    // Key 2: the network has finished. Waiting here is the only order D3D10 offers (it has no fences).
+    const Keyed back = acquire_all(images, 2, 1000);
+    if (back != Keyed::Ok) {
+        restore_predicate();
+        s.status = std::string("the network did not hand the frame back (") + keyed_text(back) + ")";
+        s.failed = true;
+        log("[nr] bridge: %s", s.status.c_str());
+        return false;
+    }
+    device->CopyResource(target, static_cast<ID3D10Resource*>(s.shared_colour.d3d));
+    restore_predicate();
+    if (!release_all(images, 0)) {
+        s.status = "a shared texture's keyed mutex was not handed back after the frame";
+        s.failed = true;
+        log("[nr] bridge: %s", s.status.c_str());
+    }
+    return true;
+}
+
+bool Session::Impl::bridge_d3d11(ID3D11Device* device, const D3D11Frame& frame, const Controls& controls) {
+    auto& s = *this;
+    const LUID luid = adapter_luid(device);
+    if (!s.ensure_bridge(luid)) return false;
+    ++s.bridge_runs;
+    s.sweep_retired_images();
+    ID3D11Texture2D* target = nullptr;
+    if (FAILED(frame.target->QueryInterface(IID_PPV_ARGS(&target))) || !target) {
+        s.status = "the D3D11 frame is not a 2D texture";
+        return false;
+    }
+    D3D11_TEXTURE2D_DESC td{};
+    target->GetDesc(&td);
+    const DXGI_FORMAT fmt = bridge::shared_format(td.Format);
+    const VkFormat vk = fmt == DXGI_FORMAT_UNKNOWN ? VK_FORMAT_UNDEFINED : vulkan_colour_format_of(fmt);
+    if (vk == VK_FORMAT_UNDEFINED || td.SampleDesc.Count != 1 || td.MipLevels != 1 || td.ArraySize != 1) {
+        target->Release();
+        s.status = "the frame's DXGI format " + std::to_string(unsigned(td.Format)) + " is not one the bridge carries";
+        return false;
+    }
+    const bool linear = (frame.upscaler_input || frame.linear_hdr) && !frame.estimate_motion && is_linear_format(vk);
+    if (!s.ensure_runtime(controls, td.Width, td.Height, vk, linear) ||
+        !s.ensure_shared(s.shared_colour, td.Width, td.Height, fmt, nullptr, device, "colour")) {
+        target->Release();
+        return false;
+    }
+    ID3D11Resource* motion = nullptr;
+    ID3D11Resource* depth = nullptr;
+    if (frame.motion) {
+        ID3D11Texture2D* m = nullptr;
+        D3D11_TEXTURE2D_DESC md{};
+        if (SUCCEEDED(frame.motion->QueryInterface(IID_PPV_ARGS(&m))) && m) {
+            m->GetDesc(&md);
+            const DXGI_FORMAT mf = bridge::shared_format(md.Format);
+            if (mf != DXGI_FORMAT_UNKNOWN && md.SampleDesc.Count == 1 && md.MipLevels == 1 && md.ArraySize == 1 &&
+                s.ensure_shared(s.shared_motion, md.Width, md.Height, mf, nullptr, device, "motion"))
+                motion = m;
+            else
+                m->Release();
+        }
+    }
+    if (frame.depth) {
+        ID3D11Texture2D* d = nullptr;
+        D3D11_TEXTURE2D_DESC dd{};
+        if (SUCCEEDED(frame.depth->QueryInterface(IID_PPV_ARGS(&d))) && d) {
+            d->GetDesc(&dd);
+            if (bridge::depth_view_format(dd.Format) != DXGI_FORMAT_UNKNOWN && dd.SampleDesc.Count == 1 &&
+                s.ensure_shared(s.shared_depth, dd.Width, dd.Height, DXGI_FORMAT_R32_FLOAT, nullptr, device, "depth"))
+                depth = d;
+            else
+                d->Release();
+        }
+    }
+    s.status.clear();
+    ID3D11DeviceContext* context = nullptr;
+    device->GetImmediateContext(&context);
+    // Our copies and the depth pass must not be skipped by a predicate the game left set; it is put back.
+    ID3D11Predicate* predicate = nullptr;
+    BOOL predicate_value = FALSE;
+    context->GetPredication(&predicate, &predicate_value);
+    if (predicate) context->SetPredication(nullptr, FALSE);
+    context->CopyResource(static_cast<ID3D11Resource*>(s.shared_colour.d3d), target);
+    if (motion) context->CopyResource(static_cast<ID3D11Resource*>(s.shared_motion.d3d), motion);
+    if (depth) {
+        std::string why;
+        if (!s.depth11.run(device, context, depth, static_cast<ID3D11Texture2D*>(s.shared_depth.d3d), &why)) {
+            if (!s.depth_warned) { s.depth_warned = true; log("[nr] bridge: running without depth: %s", why.c_str()); }
+            depth->Release();
+            depth = nullptr;
+        }
+    }
+
+    EngineFrame engine{};
+    engine.colour = bridge_frame(s.shared_colour);
+    engine.reset = frame.reset;
+    engine.motion_scale_x = frame.motion_scale_x;
+    engine.motion_scale_y = frame.motion_scale_y;
+    engine.depth_inverted = frame.depth_inverted;
+    if (motion) engine.motion = bridge_frame(s.shared_motion);
+    if (depth) engine.depth = bridge_frame(s.shared_depth);
+    bridge::Job* job = nullptr;
+    if (frame.estimate_motion && !motion) {
+        // The Present fallback: the estimator's temporal path, as run_d3d11 records it on DXVK.
+        std::string why;
+        job = s.begin_job(&why);
+        if (!job) s.status = "neural rendering skipped: " + why;
+        if (job) {
+            s.bdev->acquire(job, {&s.shared_colour});
+            try {
+                TemporalFrame temporal{};
+                temporal.reset = frame.reset;
+                s.runtime->record_temporal(s.bdev->command_buffer(job), engine.colour, controls, temporal);
+            } catch (const std::exception& e) {
+                s.bdev->abort(job);
+                job = nullptr;
+                s.status = std::string("neural rendering failed: ") + e.what();
+                s.failed = true;
+                log("[nr] %s", s.status.c_str());
+            }
+            if (job && !s.bdev->end(job, &why)) { job = nullptr; s.status = why; }
+        }
+    } else {
+        job = s.record_bridge_job(engine, motion != nullptr, depth != nullptr, controls);
+    }
+    bool ran = false;
+    if (job && s.bdev->run_between(context, job, s.bdev->generation(job))) {
+        context->CopyResource(target, static_cast<ID3D11Resource*>(s.shared_colour.d3d));
+        ran = true;
+        static bool first = true;
+        if (first) { first = false; log("[nr] bridge: first D3D11 frame handed over through the shared fence"); }
+    }
+    if (predicate) { context->SetPredication(predicate, predicate_value); predicate->Release(); }
+    context->Release();
+    if (motion) motion->Release();
+    if (depth) depth->Release();
+    target->Release();
+    return ran;
+}
+
 bool Session::run_present(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                           ID3D12Resource* back_buffer, unsigned width, unsigned height,
                           const Controls& controls) {
@@ -1334,6 +2413,22 @@ bool Session::run_d3d11(const D3D11Frame& frame, const Controls& controls) {
     if (s.failed || !frame.device || !frame.target) return false;
     s.status.clear();
 
+    // The native D3D11 runtime: the bridge, on a Vulkan device of our own.
+    if (!s.dxvk && s.mode != Impl::Mode::Interop) {
+        IDXGIVkInteropDevice* probe = nullptr;
+        const bool interop = d3d11_handles(frame.device, &probe).valid();
+        if (probe) probe->Release();
+        if (s.decide_mode(interop)) {
+            ID3D11Device* device = nullptr;
+            if (FAILED(frame.device->QueryInterface(IID_PPV_ARGS(&device))) || !device) {
+                s.status = "the D3D11 device is not a D3D11 device";
+                return false;
+            }
+            const bool ran = s.bridge_d3d11(device, frame, controls);
+            device->Release();
+            return ran;
+        }
+    }
     // DXVK's interop device is the whole of this path: it is where the Vulkan
     // handles, the submission queue and the queue lock all come from.
     if (!s.dxvk) {
@@ -1395,6 +2490,9 @@ bool Session::run_d3d11(const D3D11Frame& frame, const Controls& controls) {
     // Transition from the layout DXVK believes the image is in, and put it back:
     // the game's next use of its own texture must see what it left there.
     colour.before = colour.after = target.layout;
+    // What DXVK says the image may be used for: with SAMPLED and STORAGE the runtime reads and
+    // writes it in place at Model resolution below 100% instead of copying it out and back.
+    colour.usage = target.usage;
 
     EngineFrame engine{};
     engine.colour = colour;
@@ -1574,8 +2672,9 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
     s.handles = handles;
 
     // A Vulkan game gives us no D3D12 resource to hand back, so the output is a
-    // plain VkImage of our own rather than one borrowed from a D3D12 allocation.
-    if (!s.vk_output_valid(frame.width, frame.height, frame.colour_format)) {
+    // plain VkImage of our own rather than one borrowed from a D3D12 allocation -
+    // unless the caller takes the answer in its own image (VulkanFrame::in_place).
+    if (!frame.in_place && !s.vk_output_valid(frame.width, frame.height, frame.colour_format)) {
         if (!s.ensure_vk_output(frame.width, frame.height, frame.colour_format))
             return VK_NULL_HANDLE;
     }
@@ -1585,13 +2684,29 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
         return VK_NULL_HANDLE;
 
     ColourFrame colour{};
-    colour.image = s.vk_output;
+    colour.image = frame.in_place ? frame.colour : s.vk_output;
     colour.format = frame.colour_format;
     colour.width = frame.width; colour.height = frame.height;
-    colour.before = colour.after = VK_IMAGE_LAYOUT_GENERAL;
+    colour.before = colour.after = frame.in_place ? frame.colour_layout : VK_IMAGE_LAYOUT_GENERAL;
+    if (frame.in_place) colour.usage = frame.colour_usage;
 
     EngineFrame engine{};
     engine.colour = colour;
+    // The caller's colour read in place and its output written directly (the engine path with
+    // the model applied): the copy into vk_output, the copy into the runtime's input and the
+    // write-back all go. Anything else keeps the copies below.
+    const bool direct = !frame.in_place && frame.output && frame.motion && s.runtime && s.runtime->takes_target(controls) &&
+                        (frame.colour_usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
+                        !(std::getenv("NR_VK_COPY") && std::atoi(std::getenv("NR_VK_COPY")));
+    if (direct) {
+        engine.colour.image = frame.colour;
+        engine.colour.before = engine.colour.after = frame.colour_layout;
+        engine.colour.usage = frame.colour_usage;
+        engine.target = colour;
+        engine.target.image = frame.output;
+        engine.target.before = engine.target.after = frame.output_layout;
+        engine.target.usage = frame.output_usage;
+    }
     engine.feature = frame.feature;
     engine.reset = frame.reset;
     engine.motion_scale_x = frame.motion_scale_x;
@@ -1615,6 +2730,29 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
         apply_guide_subrect(&engine.depth, frame.depth_subrect, "depth", &engine.depth_x, &engine.depth_y);
     }
 
+    if (direct) {
+        try {
+            s.runtime->record_engine(cmd, engine, controls);
+        } catch (const std::exception& e) {
+            s.status = std::string("neural rendering failed: ") + e.what();
+            s.failed = true;
+            log("[nr] %s", s.status.c_str());
+            return VK_NULL_HANDLE;
+        }
+        return frame.output;
+    }
+    if (frame.in_place) {
+        try {
+            if (frame.motion) s.runtime->record_engine(cmd, engine, controls);
+            else s.runtime->record(cmd, colour, controls);
+        } catch (const std::exception& e) {
+            s.status = std::string("neural rendering failed: ") + e.what();
+            s.failed = true;
+            log("[nr] %s", s.status.c_str());
+            return VK_NULL_HANDLE;
+        }
+        return frame.colour;
+    }
     try {
         VkImageCopy copy{};
         copy.srcSubresource = copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};

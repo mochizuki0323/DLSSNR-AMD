@@ -1,7 +1,9 @@
 #include "nr_pe_vkdevice.hpp"
 
+#include "nr_pe_bridge.hpp"
 #include "nr_pe_log.hpp"
 #include "nr_device_features.hpp"
+#include "nr_pipeline_binary.hpp"
 
 #include <windows.h>
 #include <MinHook.h>
@@ -52,7 +54,7 @@ VkResult VKAPI_PTR hooked_create_instance(const VkInstanceCreateInfo* info,
                                           const VkAllocationCallbacks* allocator,
                                           VkInstance* out) {
     const VkResult r = real_create_instance(info, allocator, out);
-    if (r == VK_SUCCESS && out && *out) {
+    if (r == VK_SUCCESS && out && *out && !nr::pe::bridge::creating_device()) {
         std::lock_guard<std::mutex> guard(lock);
         seen.instance = *out;
     }
@@ -66,7 +68,7 @@ VkResult VKAPI_PTR hooked_create_instance(const VkInstanceCreateInfo* info,
 VkResult VKAPI_PTR hooked_enumerate_physical_devices(VkInstance instance, uint32_t* count,
                                                      VkPhysicalDevice* out) {
     const VkResult r = real_enumerate_physical_devices(instance, count, out);
-    if (instance) {
+    if (instance && !nr::pe::bridge::creating_device()) {
         std::lock_guard<std::mutex> guard(lock);
         if (!seen.instance) log("[nr] Vulkan instance learned from vkEnumeratePhysicalDevices");
         seen.instance = instance;
@@ -89,6 +91,7 @@ struct Augmented {
     std::unique_ptr<nr::DeviceFeatures> features;
     std::vector<const char*> extensions;
     VkDeviceCreateInfo info{};
+    nr::binary::Features binary;
 };
 
 // Straight from vulkan-1.dll: the DLL's own vk* entry points are resolved later than this runs.
@@ -130,11 +133,14 @@ bool augment(VkPhysicalDevice physical, const VkDeviceCreateInfo* info, Augmente
     a->info.pNext = a->features->head;
     a->info.enabledExtensionCount = uint32_t(a->extensions.size());
     a->info.ppEnabledExtensionNames = a->extensions.data();
+    a->binary.prepare(physical, a->info, a->extensions);
     return true;
 }
 
 VkResult VKAPI_PTR hooked_create_device(VkPhysicalDevice physical, const VkDeviceCreateInfo* info,
                                         const VkAllocationCallbacks* allocator, VkDevice* out) {
+    // The bridge's own device (nr_pe_bridge.hpp) is not the game's: passed straight through, unrecorded.
+    if (nr::pe::bridge::creating_device()) return real_create_device(physical, info, allocator, out);
     // The physical device is known before the call; ReShade's Vulkan layer
     // fires its device events from inside this very call, so anything that
     // runs then must already find it.
@@ -161,6 +167,7 @@ VkResult VKAPI_PTR hooked_create_device(VkPhysicalDevice physical, const VkDevic
         added = false;
         r = real_create_device(physical, info, allocator, out);
     }
+    if (added && r == VK_SUCCESS && augmented.binary.active) nr::binary::mark(*out);
     if (added && r == VK_SUCCESS) log("[nr] network features added to the game's device");
     if (r == VK_SUCCESS && out && *out) {
         {
@@ -179,6 +186,7 @@ void VKAPI_PTR hooked_get_device_queue(VkDevice device, uint32_t family, uint32_
                                        VkQueue* out) {
     real_get_device_queue(device, family, index, out);
     if (!out || !*out) return;
+    if (nr::pe::bridge::creating_device() || nr::pe::bridge::is_own_device(device)) return;
     std::lock_guard<std::mutex> guard(lock);
     for (const auto& q : queues)
         if (q.queue == *out) return;
@@ -189,6 +197,7 @@ void VKAPI_PTR hooked_get_device_queue2(VkDevice device, const VkDeviceQueueInfo
                                         VkQueue* out) {
     real_get_device_queue2(device, info, out);
     if (!out || !*out || !info) return;
+    if (nr::pe::bridge::creating_device() || nr::pe::bridge::is_own_device(device)) return;
     std::lock_guard<std::mutex> guard(lock);
     for (const auto& q : queues)
         if (q.queue == *out) return;

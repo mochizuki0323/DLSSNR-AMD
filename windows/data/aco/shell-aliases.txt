@@ -1,0 +1,7 @@
+g_fswindsp32nh.spv g_fswindsp32.spv
+g_fswinfusedup32nh.spv g_fswinfusedup32.spv
+g_gemmprojc.spv g_gemmproj5.spv
+temporal_pre_fp32nh.spv temporal_pre_fp32.spv
+temporal_pre_fp32nhhp.spv temporal_pre_fp32.spv
+temporal_post_fp32h16.spv temporal_post_fp32.spv
+temporal_post_fp32hp.spv temporal_post_fp32.spv

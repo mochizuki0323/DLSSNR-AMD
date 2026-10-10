@@ -468,6 +468,7 @@ layout(set = 0, binding = 7, std430) NR_COH readonly buffer ActU32V { uint act_u
 layout(set = 0, binding = 3, std430) readonly buffer WgtU32V { uint wgt_u32v[]; };
 #endif
 
+#define NR_TC_WBIND 3   // NR_TCHAIN reads its records from the weight buffer
 #include "nr_chain.glsl"
 #include "occ_pad.glsl"
 layout(push_constant) uniform Push {
@@ -497,6 +498,7 @@ layout(push_constant) uniform Push {
     uint remap;       // workgroup order, 0 = launch order (see mg0 below)
 #endif
     NR_CHAIN_FIELDS
+    NR_TCHAIN_FIELDS
 } pc;
 #ifndef NR_RBDA
 #define NR_RBDA 0
@@ -1484,6 +1486,7 @@ void nr_finish_qkv_pair(NR_FRAG_ACC a, NR_FRAG_ACC b, uint tok0, uint ch0, uint 
 void main() {
     NR_PROF_BEGIN()
     nr_chain_wait()
+    NR_TC_PROLOGUE
 #if NR_COHERENT_ACT
     // Keep every activation view both read and written; see coherent_act.glsl.
     if (NR_COH_NEVER) {
@@ -1520,6 +1523,7 @@ void main() {
     const uint ng0 = gl_WorkGroupID.y * uint(NR_NTILE);
 #endif
     const uint nchunk = pc.K / uint(NR_KCHUNK);
+    nr_tchain_wait(mg0 / 16u, NR_MTILE / 16)   // NR_TCHAIN: the M tile's token tiles
 
 #if defined(NR_A_DIRECT) || defined(NR_B_DIRECT)
     uint abase_g[NR_MFRAG];
@@ -1614,5 +1618,6 @@ void main() {
 #endif
     NR_OCC_USE(pc.K == 0u, act_f32[0] = 0.0)
     nr_chain_signal()
+    nr_tchain_signal_wave((mg0 + mloc) / 16u, NR_MFRAG)
     NR_PROF_END(pc.o_off)
 }

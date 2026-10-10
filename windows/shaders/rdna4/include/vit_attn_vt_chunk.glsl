@@ -1,8 +1,12 @@
 // The key-block loop of vit_attn.comp's NR_VTRANS path, included twice.
-// NR_VT_GUARD 1: a chunk that may run past `pc.tokens` (tiles beyond it read
-// zero K and contribute no probability to P.V). NR_VT_GUARD 0: a full chunk,
-// where both tests are constant and the zero-or-load phi they created - which
-// ACO copied with four byte-inserting `v_perm_b32` a dword - does not exist.
+// NR_VT_GUARD 1: a chunk that may run past `pc.tokens`. A key tile beyond it
+// reads the last real tile's K (as V does below) and is taken out where its
+// numbers are scalars: logit 0, which is what a zero K tile gave and what the
+// padding subtraction after the loop removes, and probability 0 in P.V. No
+// cooperative matrix is chosen between a load and zeros.
+// NR_VT_GUARD 0: a full chunk, where both tests are constant and the
+// zero-or-load phi they created - which ACO copied with four byte-inserting
+// `v_perm_b32` a dword - does not exist.
         for (uint kb = 0u; kb < uint(NR_KC); kb += 16u) {
             // K as the A operand: the same addresses its ColumnMajor B load read.
             NR_FRAG_A kfr[2];
@@ -15,11 +19,12 @@
                 }
 #elif NR_VADDR && NR_VT_GUARD == 0
                 NR_LOAD_A_ACT(kfr[d], kcb + kb * X3 + d * 256u, 16u);
-#else
-                if (NR_VT_GUARD == 0 || j0 + kb < pc.tokens)
-                    NR_LOAD_A_ACT(kfr[d],
+#elif NR_VT_GUARD == 0
+                NR_LOAD_A_ACT(kfr[d],
                               nr_at16(pc.x_off, j0 + kb, kbase + d * 16u, X3), 16u);
-                else kfr[d] = NR_FRAG_A(0.0);
+#else
+                NR_LOAD_A_ACT(kfr[d],
+                              nr_at16(pc.x_off, min(j0 + kb, jlast), kbase + d * 16u, X3), 16u);
 #endif
             }
             // V^T as the A operand, hoisted out of the query blocks. Clamped to
@@ -62,13 +67,21 @@
                     a *= vec2(lds_ki[kb + row0 + uint(c)],
                               lds_ki[kb + row0 + uint(c) + 1u]);
 #endif
+#if NR_VT_GUARD
+                    if (j0 + kb >= pc.tokens) a = vec2(0.0);
+#endif
                     f16vec2 pp = nr_vit_exp2(a);
 #if NR_VQP
                     pp = f16vec2(nr_quant_e4m3(pp.x * NR_F16(ps)),
                                  nr_quant_e4m3(pp.y * NR_F16(ps)));
 #endif
                     pv[c >> 1] = pp;
+#if NR_VT_GUARD
+                    const NR_F16 kin = NR_F16(j0 + kb < pc.tokens ? 1.0 : 0.0);   // 0 past the last token
+                    ph[c] = pp.x * kin; ph[c+1] = pp.y * kin;
+#else
                     ph[c] = pp.x; ph[c+1] = pp.y;
+#endif
                 }
                 // The PTX reduction, in lane. `shuffleXor(16)` is the pair eight
                 // keys apart - the other half wave holds them - and the four-pair
@@ -125,13 +138,11 @@
                 // Accumulator's components and a B operand's are the same map
                 // (coopmm.glsl's probe table), so this copy moves no data - it
                 // is the whole point of the orientation. A padding key tile is
-                // killed here exactly as it was before the transpose.
+                // already 0 in `ph`.
 #if NR_VPB16
                 NR_FRAG_B pf = NR_FRAG_B(ph);
-                if (NR_VT_GUARD != 0 && j0 + kb >= pc.tokens) pf = NR_FRAG_B(0.0);
 #else
                 NR_FRAG_E4M3 pe = NR_FRAG_E4M3(ph);
-                if (NR_VT_GUARD != 0 && j0 + kb >= pc.tokens) pe = NR_FRAG_E4M3(0.0);
                 NR_FRAG_B pf;
 #if NR_VKPERM && NR_VT_GUARD == 0
                 {
